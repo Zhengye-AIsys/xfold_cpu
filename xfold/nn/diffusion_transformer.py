@@ -20,6 +20,7 @@ import einops
 from xfold.nn import atom_layout
 from xfold import fastnn
 from xfold.fastnn.gated_linear_unit import GLUWeightCache
+from xfold.fastnn import config as fastnn_config
 
 
 class AdaptiveLayerNorm(nn.Module):
@@ -153,8 +154,33 @@ class SelfAttention(nn.Module):
 
         self.adaptive_zero_init = AdaLNZero(
             self.c_x, self.c_x, self.c_single_cond, self.use_single_cond)
+        self._native_weights = {name: GLUWeightCache() for name in (
+            'q_projection', 'k_projection', 'v_projection', 'gating_query')}
 
     def forward(self,
+                x: torch.Tensor,
+                mask: torch.Tensor,
+                pair_logits: Optional[torch.Tensor] = None,
+                single_cond: Optional[torch.Tensor] = None) -> torch.Tensor:
+        if fastnn_config.dot_product_attention_implementation == 'cpp':
+            return self._forward_cpp(x, mask, pair_logits, single_cond)
+        return self._forward_torch(x, mask, pair_logits, single_cond)
+
+    def _forward_cpp(self, x, mask, pair_logits=None, single_cond=None):
+        from xfold.fastnn.native import linear_cpp
+
+        assert (single_cond is None) == (self.use_single_cond is False)
+        x = self.adaptive_layernorm(x, single_cond)
+        q, k, v = [linear_cpp(x, getattr(self, name), self._native_weights[name])
+                   for name in ('q_projection', 'k_projection', 'v_projection')]
+        q, k, v = [einops.rearrange(t, 'n (h c) -> h n c', h=self.num_head).unsqueeze(0) for t in (q, k, v)]
+        out = fastnn.dot_product_attention(q, k, v, mask=mask, bias=pair_logits)
+        out = einops.rearrange(out.squeeze(0), 'h q c -> q (h c)')
+        gate = linear_cpp(x, self.gating_query, self._native_weights['gating_query'])
+        out *= torch.sigmoid(gate)
+        return self.adaptive_zero_init(out, single_cond)
+
+    def _forward_torch(self,
                 x: torch.Tensor,
                 mask: torch.Tensor,
                 pair_logits: Optional[torch.Tensor] = None,

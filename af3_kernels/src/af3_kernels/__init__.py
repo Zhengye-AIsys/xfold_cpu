@@ -5,10 +5,11 @@ from importlib import import_module
 import platform
 
 
-__version__ = '0.2.0'
+__version__ = '0.3.0'
 __all__ = [
     'is_available', 'load_extension', 'runtime_info',
     'pad_and_align_tensor', 'vnni_repack_tensor', 'gemm', 'gated_linear_unit',
+    'linear', 'triangle_multiplication', 'dot_product_attention',
 ]
 
 
@@ -63,3 +64,30 @@ def gated_linear_unit(x, weight, M_BLK=128, N_BLK=128):
     the xfold bridge handles autocast, contiguous copies, and weight caching.
     """
     return load_extension().gated_linear_unit(x, weight, M_BLK, N_BLK)
+
+
+def linear(x, weight, bias=None):
+    """Raw CPU inference Linear: [..., K] @ [K, N] + [N]; matching FP32/BF16."""
+    return load_extension().linear(x, weight, bias)
+
+
+def triangle_multiplication(
+    pair, mask, outgoing, left_weight, left_bias, projection, gate,
+    center_weight, center_bias, output_weight, gating_weight,
+    left_eps=1e-5, center_eps=1e-5, block_size=128,
+):
+    """Raw Triangle update, without residual addition. Linear weights are [K, N]."""
+    return load_extension().triangle_multiplication(
+        pair, mask, outgoing, left_weight, left_bias, projection, gate,
+        center_weight, center_bias, output_weight, gating_weight,
+        left_eps, center_eps, block_size,
+    )
+
+
+def dot_product_attention(q, k, v, mask=None, bias=None, query_block=128, q_pre_scaled=False):
+    """Raw CPU inference attention [B, H, Q/K, D], matching FP32/BF16.
+
+    Broadcastable mask/bias, finite -1e9 masking. No implicit autocast or NaN cleanup.
+    q_pre_scaled is reserved for the bridge that scales before the autocast cast.
+    """
+    return load_extension().dot_product_attention(q, k, v, mask, bias, query_block, q_pre_scaled)

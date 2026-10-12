@@ -54,7 +54,7 @@ class ExtensionStaticTests(unittest.TestCase):
             with self.subTest(path=path.relative_to(ROOT)):
                 tree = ast.parse(path.read_text())
                 self.assertFalse(any(name.startswith('af3_kernels') for name in eager_imports(tree)))
-                if path != ROOT / 'xfold/fastnn/gated_linear_unit.py':
+                if path not in (ROOT / 'xfold/fastnn/gated_linear_unit.py', ROOT / 'xfold/fastnn/native.py'):
                     for node in ast.walk(tree):
                         if isinstance(node, ast.Import):
                             self.assertFalse(any(item.name.startswith('af3_kernels') for item in node.names))
@@ -132,6 +132,8 @@ class ExtensionStaticTests(unittest.TestCase):
         self.assertEqual(ast.literal_eval(extension[0].args[0]), 'af3_kernels._C')
         options = {item.arg: item.value for item in extension[0].keywords}
         self.assertIn('src/csrc/gated_linear_unit.cpp', ast.literal_eval(options['sources']))
+        for operator in ('matrix', 'triangle_multiplication', 'dot_product_attention'):
+            self.assertIn(f'src/csrc/{operator}.cpp', ast.literal_eval(options['sources']))
         for name in ast.literal_eval(options['sources']):
             self.assertFalse(Path(name).is_absolute())
             self.assertTrue((EXTENSION / name).is_file())
@@ -144,15 +146,17 @@ class ExtensionStaticTests(unittest.TestCase):
 
     def test_python_native_tools_match_bindings(self):
         names = set(re.findall(r'module\.def\("([a-z_]+)"', self.bindings))
-        self.assertEqual(names, {'runtime_info', 'pad_and_align_tensor', 'vnni_repack_tensor', 'gemm', 'gated_linear_unit'})
+        self.assertEqual(names, {
+            'runtime_info', 'pad_and_align_tensor', 'vnni_repack_tensor', 'gemm',
+            'gated_linear_unit', 'linear', 'triangle_multiplication', 'dot_product_attention',
+        })
         for name in names:
             function = next(node for node in self.package.body if getattr(node, 'name', None) == name)
             self.assertEqual(len(calls(function, f'load_extension().{name}')), 1)
-        self.assertNotIn('triangle_multiplication', names)
         self.assertNotIn('attention', names)
 
     def test_native_libxsmm_api_names_exist_in_pinned_headers(self):
-        code = self.native + self.bindings + (EXTENSION / 'src/csrc/gated_linear_unit.cpp').read_text()
+        code = '\n'.join(path.read_text() for path in (EXTENSION / 'src/csrc').glob('*.cpp'))
         header = (VENDOR / 'include/libxsmm.h').read_text()
         typedefs = (VENDOR / 'include/libxsmm_typedefs.h').read_text()
         apis = set(re.findall(r'\b(libxsmm_[a-z_]+)\s*\(', code))
@@ -164,6 +168,29 @@ class ExtensionStaticTests(unittest.TestCase):
             self.assertIn(name, typedefs)
         self.assertIn('LIBXSMM_DATATYPE_F32, LIBXSMM_DATATYPE_F32', self.native)
         self.assertIn('kernel != nullptr', self.native)
+
+    def test_native_declarations_definitions_and_binding_arities_match(self):
+        header = (EXTENSION / 'src/csrc/tools.h').read_text()
+        code = '\n'.join(path.read_text() for path in (EXTENSION / 'src/csrc').glob('*.cpp'))
+        declarations = dict(re.findall(r'\bat::Tensor\s+(\w+)\s*\(([^)]*)\)\s*;', header, re.S))
+        definitions = dict(re.findall(r'\bat::Tensor\s+(\w+)\s*\(([^)]*)\)\s*\{', code, re.S))
+
+        def parameters(signature):
+            return [' '.join(item.split('=')[0].split()) for item in signature.split(',')]
+
+        for name, signature in declarations.items():
+            with self.subTest(name=name):
+                self.assertIn(name, definitions)
+                self.assertEqual(parameters(signature), parameters(definitions[name]))
+        for binding in self.bindings.split('module.def(')[1:]:
+            target = re.match(r'"([a-z_]+)",\s*&(\w+)', binding)
+            if target is None:  # runtime_info is a lambda, not a tensor entry point.
+                continue
+            public_name, symbol = target.groups()
+            with self.subTest(binding=public_name):
+                self.assertIn(symbol, declarations)
+                self.assertEqual(len(re.findall(r'py::arg\(', binding)),
+                                 len(parameters(declarations[symbol])))
 
     def test_native_input_and_allocation_guards_are_present(self):
         for requirement in (

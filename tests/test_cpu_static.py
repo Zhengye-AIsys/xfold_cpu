@@ -131,7 +131,9 @@ class CPUStaticTests(unittest.TestCase):
             )
             expected = (
                 "implementation if glu_backend == 'auto' else glu_backend"
-                if backend == 'gated_linear_unit' else 'implementation'
+                if backend == 'gated_linear_unit' else
+                "implementation if attention_backend == 'auto' else attention_backend"
+                if backend == 'dot_product_attention' else 'implementation'
             )
             self.assertEqual(ast.unparse(assignment.value), expected)
             self.assertLess(assignment.lineno, model_creation.lineno)

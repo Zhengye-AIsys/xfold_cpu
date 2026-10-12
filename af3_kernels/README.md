@@ -1,8 +1,10 @@
-# Optional C++ / LIBXSMM tools and GLU (stages 3–4)
+# Optional C++ / LIBXSMM CPU operators (stages 3–6)
 
 This is a separate, optional package. Installing or importing xfold does not build,
-load, or require it. Stage 3 added tools only. Stage 4 adds a GLU operator selected
-explicitly by `--glu_backend=cpp`; default FP32/BF16 inference still uses PyTorch.
+load, or require it. Stage 3 added tools; stage 4 added opt-in GLU. Stages 5/6
+add opt-in Triangle Multiplication and Grid/SelfAttention. Default FP32/BF16 CPU
+inference still uses PyTorch. Package version 0.3.0 must be rebuilt on the cluster
+to include the new bindings, even if an earlier stage is already installed.
 
 ## Source and build
 
@@ -110,6 +112,62 @@ the old backend selection, while `torch` and `cpp` select GLU explicitly. A `cpp
 request preflights loading before model/weight construction and rejects CUDA or
 an old extension without the GLU symbol. There is no automatic fallback.
 
+## Triangle and Attention operators (stages 5–6)
+
+All new raw APIs require CPU inference tensors with resolved views and no
+gradients. They do not infer CPU autocast state. The xfold bridges handle autocast,
+detaching inference parameters, contiguous copies, and cache invalidation.
+
+- `linear(x, weight, bias=None)` accepts `[..., K]`, transposed weight `[K, N]`,
+  and optional `[N]` bias, all contiguous with matching FP32/BF16 dtype. Output
+  is `[..., N]` in that dtype. It flattens leading dimensions, tiles the matrix
+  operation, adds the selected-dtype bias to FP32 accumulation, and only then
+  rounds/stores the result. Batched tiled GEMM is also used internally by Triangle.
+- `triangle_multiplication(pair, mask, outgoing, left_weight, left_bias,
+  projection, gate, center_weight, center_bias, output_weight, gating_weight,
+  left_eps=1e-5, center_eps=1e-5, block_size=128)` returns only the Triangle update
+  `[N, N, C]`. Pair input is contiguous FP32/BF16; mask may be absent, scalar,
+  `[N]`, or broadcastable to `[N, N]` and is used multiplicatively. Linear weights
+  are contiguous `[C, 2*C]`, `[C, 2*C]`, `[C, C]`, `[C, C]`, all in the selected
+  compute dtype. Normalization vectors keep their own compatible input dtype,
+  with optional biases. ATen implements LayerNorm/sigmoid in C++; LIBXSMM handles
+  projections and contraction. Adjacent projected channels form A/B. Outgoing
+  computes `A @ B.T`; incoming computes `B.T @ A`. Projection/gate/contraction
+  inputs are released before output projections to limit overlapping allocations.
+- `dot_product_attention(q, k, v, mask=None, bias=None, query_block=128,
+  q_pre_scaled=False)` accepts contiguous matching-dtype FP32/BF16 Q/K/V of
+  shapes `[B, H, Q, D]`, `[B, H, K, D]`, `[B, H, K, Dv]`. Q/K may have different
+  lengths, and D/Dv need not match. Bias is FP32/BF16 and broadcastable to
+  `[B, H, Q, K]`. Mask rank 1 means `[K]`, rank 2 means `[B, K]`; those ranks are
+  converted to bool. Other mask ranks up to 4 must already be boolean and
+  broadcastable. True means a valid key. Broadcast views retain their strides
+  rather than materializing full mask/bias tensors. Zero-length keys return a
+  zero output, and empty batches/heads/queries return empty outputs.
+
+Native attention scales Q once, uses LIBXSMM for QK/PV, and uses FP32 max/exp/sum
+inside a query tile for softmax. Projection, bias addition, softmax, and PV outputs
+follow the selected dtype boundaries. The xfold bridge scales Q before casting
+for the first matmul, then passes `q_pre_scaled=True` to avoid scaling twice.
+The finite `-1e9` mask is applied after bias, matching the original PyTorch code;
+fully masked real rows retain its uniform softmax. NaNs/infinities are not hidden
+with `nan_to_num`. Odd BF16 head/K dimensions are padded for VNNI2; internal PV
+padding receives zero probability. This computes full-key softmax per query block,
+not online softmax. Scratch is proportional to `threads * query_block * K`, plus
+one FP32 exponential row per thread; packing buffers and original model bias
+storage are additional allocations. It does not prove reduced total peak memory
+or a speedup without cluster measurements.
+
+`GridSelfAttention` uses native bias/Q/K/V/gating/output projections and native
+attention, while its normalization and transpose flow remain in Python/PyTorch.
+Diffusion `SelfAttention` uses native Q (including bias)/K/V/gating and attention,
+while adaptive normalization/output conditioning remain PyTorch. MSA and
+CrossAttention are unchanged. Each module keeps its existing parameter names
+and owns stage 4 cache objects; no replacement class is selected at import time.
+
+`--triangle_backend=auto|torch|cpp` and `--attention_backend=auto|torch|cpp` select
+the two families independently. `cpp` preflights the required native symbols
+before model/weight construction. PyTorch/CUDA defaults remain unchanged.
+
 ## Validation status
 
 On the development Mac, validation is source-only:
@@ -121,6 +179,9 @@ python -m unittest discover -s tests -p 'test_*static.py' -v
 The checks cover Python syntax, optional loading, build configuration, packaging,
 source checksums, native interface/API consistency, backend selection, autocast
 bridging, cache lifecycle, both Transition call sites, and edge-shape guards.
+Stages 5/6 also check explicit dispatch, preserved parameter modules, Triangle
+directions/interleaving/residual ownership, attention broadcast/scaling/masking,
+bias rounding, and bounded scratch allocation before parallel execution.
 They do not compile the native extension or test GLU/GEMM/VNNI correctness.
 
 On the target cluster, validation should proceed in this order:
@@ -146,14 +207,37 @@ On the target cluster, validation should proceed in this order:
 
 These cluster steps are documented for later execution; none ran on the Mac.
 
+Additional stages 5/6 cluster validation:
+
+1. Rebuild the 0.3.0 package and check the `linear`, `triangle_multiplication`, and
+   `dot_product_attention` symbols before model inference.
+2. Compare Linear with/without bias and Triangle in both directions against
+   PyTorch, first FP32, then explicit BF16, then BF16 autocast with FP32 stored
+   parameters. Include fractional masks, empty dimensions, odd channel/token
+   sizes, and tiles below/equal/above the block size. Confirm residual addition
+   happens exactly once and weights/checkpoint keys remain unchanged.
+3. Compare attention with D and Dv equal/unequal, odd/even D/K, unequal Q/K
+   lengths, query-block remainders, absent bias/mask, broadcasted and noncontiguous
+   bias/mask, rank-1/rank-2 key masks, rank-3/rank-4 boolean masks, and empty keys.
+   Cover partially/fully masked rows, extreme logits, and NaN/infinity behavior.
+   Measure absolute/relative errors and choose tolerances from recorded results.
+4. Compare both Grid transpose directions and conditioned/unconditioned diffusion
+   SelfAttention, including Q bias. Reload/mutate/move weights and switch precision
+   to check cache refreshes. Run end-to-end comparisons with Triangle and Attention
+   individually enabled before combining them with stage 4 GLU.
+5. Hold input/seeds/samples/threads fixed; record cold/warm timings and peak memory
+   as well as output differences. Inspect generated kernels to verify AMX use.
+
 ## Attribution
 
 The stage 3 setup script, minimal bindings, and Python loader are newly implemented.
 The padding and packing tools are rewritten using the reference interfaces and
 LIBXSMM APIs. The stage 4 GLU is a new implementation of the reference's tiled
 projection idea, using the pinned public LIBXSMM API rather than copying its
-functor/timing framework. Reference Triangle Multiplication, Attention, and timing
-implementations were not copied. Newly written source files carry no Xflops brand
+functor/timing framework. Stages 5/6 implement the Triangle and blocked Attention
+ideas with the pinned public LIBXSMM API and the original xfold semantics; the
+reference implementations and timing framework were not copied. Newly written
+source files carry no Xflops brand
 or copyright claim. Third-party licenses and required notices are retained.
 
 Padding and VNNI interfaces follow the BSD-licensed af3_kernels reference.

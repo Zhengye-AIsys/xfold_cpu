@@ -14,6 +14,8 @@ import torch
 import torch.nn as nn
 
 from xfold import fastnn
+from xfold.fastnn import config as fastnn_config
+from xfold.fastnn.gated_linear_unit import GLUWeightCache
 
 
 class TriangleMultiplication(nn.Module):
@@ -32,8 +34,36 @@ class TriangleMultiplication(nn.Module):
         self.equation='ckj,cki->cij'
         if _outgoing is True:
             self.equation='cik,cjk->cij'
+        self._native_weights = {name: GLUWeightCache() for name in (
+            'projection', 'gate', 'output_projection', 'gating_linear')}
 
     def forward(self, pair: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        if fastnn_config.triangle_multiplication_implementation == 'cpp':
+            return self._forward_cpp(pair, mask)
+        if fastnn_config.triangle_multiplication_implementation == 'torch':
+            return self._forward_torch(pair, mask)
+        raise ValueError('Unknown triangle_multiplication_implementation: '
+                         f'{fastnn_config.triangle_multiplication_implementation}')
+
+    def _forward_cpp(self, pair, mask):
+        from xfold.fastnn.native import check_cpu_inference, compute_dtype, load_native_operator, prepare_tensor
+
+        parameters = tuple(self.parameters())
+        check_cpu_inference(pair, mask, *parameters)
+        names = ('projection', 'gate', 'output_projection', 'gating_linear')
+        dtype = compute_dtype(pair, *(getattr(self, name).weight for name in names))
+        extension = load_native_operator('triangle_multiplication')
+        with torch.amp.autocast(device_type='cpu', enabled=False):
+            weights = [self._native_weights[name].prepare(
+                getattr(self, name).weight.T.resolve_conj().resolve_neg(), dtype) for name in names]
+            return extension.triangle_multiplication(
+                prepare_tensor(pair), prepare_tensor(mask), self.equation == 'cik,cjk->cij',
+                prepare_tensor(self.left_norm_input.weight), prepare_tensor(self.left_norm_input.bias),
+                *weights[:2], prepare_tensor(self.center_norm.weight), prepare_tensor(self.center_norm.bias),
+                *weights[2:], self.left_norm_input.eps, self.center_norm.eps,
+            )
+
+    def _forward_torch(self, pair: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         """
         Args:
             pair (torch.Tensor): [N_token, N_token, c_pair]

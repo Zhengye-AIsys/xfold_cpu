@@ -27,4 +27,19 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
                py::arg("x"), py::arg("weight"),
                py::arg("M_BLK") = 128, py::arg("N_BLK") = 128,
                py::call_guard<py::gil_scoped_release>());
+    module.def("linear", &xsmm_linear, py::arg("x"), py::arg("weight"),
+               py::arg("bias") = py::none(), py::call_guard<py::gil_scoped_release>());
+    module.def("triangle_multiplication", &xsmm_triangle_multiplication,
+               py::arg("pair"), py::arg("mask"), py::arg("outgoing"),
+               py::arg("left_weight"), py::arg("left_bias"),
+               py::arg("projection"), py::arg("gate"),
+               py::arg("center_weight"), py::arg("center_bias"),
+               py::arg("output_weight"), py::arg("gating_weight"),
+               py::arg("left_eps") = 1e-5, py::arg("center_eps") = 1e-5,
+               py::arg("block_size") = 128, py::call_guard<py::gil_scoped_release>());
+    module.def("dot_product_attention", &xsmm_dot_product_attention,
+               py::arg("q"), py::arg("k"), py::arg("v"),
+               py::arg("mask") = py::none(), py::arg("bias") = py::none(),
+               py::arg("query_block") = 128, py::arg("q_pre_scaled") = false,
+               py::call_guard<py::gil_scoped_release>());
 }

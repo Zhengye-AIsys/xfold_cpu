@@ -10,6 +10,13 @@
 
 namespace af3_detail {
 
+void check_auxiliary(const at::Tensor& tensor) {
+    TORCH_CHECK(tensor.device().is_cpu() && tensor.layout() == at::kStrided,
+                "Native auxiliary tensors must be strided CPU tensors.");
+    TORCH_CHECK(!tensor.requires_grad() && !tensor.is_conj() && !tensor.is_neg(),
+                "Native auxiliary tensors require resolved views without gradients.");
+}
+
 void check_tensor(const at::Tensor& tensor) {
     TORCH_CHECK(tensor.device().is_cpu(), "Native tools require CPU tensors.");
     TORCH_CHECK(tensor.layout() == at::kStrided, "Native tools require strided tensors.");

@@ -14,6 +14,8 @@ import torch
 import torch.nn as nn
 
 from xfold import fastnn
+from xfold.fastnn import config as fastnn_config
+from xfold.fastnn.gated_linear_unit import GLUWeightCache
 
 
 class GridSelfAttention(nn.Module):
@@ -35,8 +37,28 @@ class GridSelfAttention(nn.Module):
         self.gating_query = nn.Linear(self.c_pair, self.c_pair, bias=False)
         self.output_projection = nn.Linear(
             self.c_pair, self.c_pair, bias=False)
+        self._native_weights = {name: GLUWeightCache() for name in (
+            'pair_bias_projection', 'q_projection', 'k_projection', 'v_projection',
+            'gating_query', 'output_projection')}
 
     def _attention(self, pair: torch.Tensor, mask: torch.Tensor, bias: torch.Tensor):
+        if fastnn_config.dot_product_attention_implementation == 'cpp':
+            return self._attention_cpp(pair, mask, bias)
+        return self._attention_torch(pair, mask, bias)
+
+    def _attention_cpp(self, pair, mask, bias):
+        from xfold.fastnn.native import linear_cpp
+
+        q, k, v = [linear_cpp(pair, getattr(self, name), self._native_weights[name])
+                   for name in ('q_projection', 'k_projection', 'v_projection')]
+        q, k, v = [einops.rearrange(t, 'b n (h d) -> b h n d', h=self.num_head) for t in (q, k, v)]
+        out = fastnn.dot_product_attention(q, k, v, mask=mask, bias=bias)
+        out = einops.rearrange(out, 'b h n d -> b n (h d)')
+        gate = linear_cpp(pair, self.gating_query, self._native_weights['gating_query'])
+        out *= torch.sigmoid(gate)
+        return linear_cpp(out, self.output_projection, self._native_weights['output_projection'])
+
+    def _attention_torch(self, pair: torch.Tensor, mask: torch.Tensor, bias: torch.Tensor):
         q = self.q_projection(pair)
         k = self.k_projection(pair)
         v = self.v_projection(pair)
@@ -65,7 +87,12 @@ class GridSelfAttention(nn.Module):
         """
 
         pair = self.act_norm(pair)
-        nonbatched_bias = self.pair_bias_projection(pair).permute(2, 0, 1)
+        if fastnn_config.dot_product_attention_implementation == 'cpp':
+            from xfold.fastnn.native import linear_cpp
+            nonbatched_bias = linear_cpp(
+                pair, self.pair_bias_projection, self._native_weights['pair_bias_projection']).permute(2, 0, 1)
+        else:
+            nonbatched_bias = self.pair_bias_projection(pair).permute(2, 0, 1)
 
         if self.transpose:
             pair = pair.permute(1, 0, 2)

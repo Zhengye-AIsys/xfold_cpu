@@ -100,7 +100,7 @@ _DEVICE = flags.DEFINE_enum(
     'auto',
     ['auto', 'cpu', 'cuda'],
     'Inference device. auto uses CUDA when available, otherwise CPU. '
-    'CPU inference uses --cpu_precision and --glu_backend.',
+    'CPU inference uses --cpu_precision and the GLU/Triangle/Attention backend flags.',
 )
 
 _CPU_PRECISION = flags.DEFINE_enum(
@@ -116,7 +116,7 @@ _USE_FASTNN = flags.DEFINE_bool(
     'fastnn',
     True,
     'Whether to use Triton operators for CUDA inference. '
-    'CPU GLU is selected separately with --glu_backend.',
+    'CPU native operators are selected separately with their backend flags.',
 )
 
 _GLU_BACKEND = flags.DEFINE_enum(
@@ -126,6 +126,18 @@ _GLU_BACKEND = flags.DEFINE_enum(
     'GLU backend. auto preserves PyTorch CPU / fastnn CUDA behavior; '
     'torch selects PyTorch GLU; cpp explicitly selects the optional CPU '
     'C++/LIBXSMM extension. LayerNorm and Attention are selected separately.',
+)
+
+_TRIANGLE_BACKEND = flags.DEFINE_enum(
+    'triangle_backend', 'auto', ['auto', 'torch', 'cpp'],
+    'Triangle Multiplication backend. auto/torch preserve PyTorch; '
+    'cpp selects the optional CPU C++/LIBXSMM implementation.',
+)
+_ATTENTION_BACKEND = flags.DEFINE_enum(
+    'attention_backend', 'auto', ['auto', 'torch', 'cpp'],
+    'Grid/SelfAttention backend. auto preserves fastnn selection; torch uses '
+    'PyTorch; cpp uses CPU native projections and dot-product attention. '
+    'MSA/CrossAttention keep their existing implementation.',
 )
 
 # Binary paths.
@@ -238,6 +250,8 @@ class ModelRunner:
         device: torch.device,
         cpu_precision: str = 'fp32',
         glu_backend: str = 'auto',
+        triangle_backend: str = 'auto',
+        attention_backend: str = 'auto',
     ):
         self._model_dir = model_dir
         self._device = torch.device(device)
@@ -265,15 +279,33 @@ class ModelRunner:
             from xfold.fastnn.gated_linear_unit import load_cpp_glu
             load_cpp_glu()
 
+        for name, backend, operators in (
+            ('triangle', triangle_backend, ('triangle_multiplication',)),
+            ('attention', attention_backend, ('linear', 'dot_product_attention')),
+        ):
+            if backend not in ('auto', 'torch', 'cpp'):
+                raise ValueError(f'{name} backend must be auto, torch, or cpp.')
+            if backend == 'cpp':
+                if self._device.type != 'cpu':
+                    raise ValueError(f'--{name}_backend=cpp requires --device=cpu.')
+                from xfold.fastnn.native import load_native_operator
+                for operator in operators:
+                    load_native_operator(operator)
+
         implementation = (
             'triton' if self._device.type == 'cuda' and _USE_FASTNN.value
             else 'torch'
         )
         fastnn_config.layer_norm_implementation = implementation
-        fastnn_config.dot_product_attention_implementation = implementation
+        fastnn_config.dot_product_attention_implementation = (
+            implementation if attention_backend == 'auto' else attention_backend)
         fastnn_config.gated_linear_unit_implementation = (
             implementation if glu_backend == 'auto' else glu_backend)
         print(f'GLU backend: {fastnn_config.gated_linear_unit_implementation}')
+        fastnn_config.triangle_multiplication_implementation = (
+            'torch' if triangle_backend == 'auto' else triangle_backend)
+        print(f'Triangle backend: {fastnn_config.triangle_multiplication_implementation}; '
+              f'Attention backend: {fastnn_config.dot_product_attention_implementation}')
 
         self._model = AlphaFold3(num_samples=_NUM_DIFFUSION_SAMPLES.value)
         self._model.eval()
@@ -674,6 +706,8 @@ def main(_):
             device=device,
             cpu_precision=_CPU_PRECISION.value,
             glu_backend=_GLU_BACKEND.value,
+            triangle_backend=_TRIANGLE_BACKEND.value,
+            attention_backend=_ATTENTION_BACKEND.value,
         )
     else:
         print('Skipping running model inference.')

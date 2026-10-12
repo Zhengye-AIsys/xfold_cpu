@@ -187,6 +187,66 @@ must cover native compilation, GLU/Transition numerical comparisons, edge shapes
 cache invalidation, full inference, and timing with matched CPU/thread settings.
 See [native operator details and cluster validation](af3_kernels/README.md).
 
+### Triangle Multiplication and Attention (stages 5–6)
+
+Stage 5 adds `--triangle_backend=cpp` for both outgoing and incoming Triangle
+Multiplication. Its four Linear operations and channel-wise contraction use tiled
+LIBXSMM GEMMs. LayerNorm and sigmoid run through ATen in C++; this is not a new
+LIBXSMM LayerNorm implementation. It preserves the original adjacent-channel
+pairing, mask multiplication order, and return of an update without adding the
+residual. Pairformer still owns the residual addition.
+
+Stage 6 adds `--attention_backend=cpp` for `GridSelfAttention` and diffusion
+`SelfAttention`. Q/K/V, query gating, Grid bias/output projections, and the two
+attention GEMMs use native kernels. The SelfAttention Q bias is added to FP32
+accumulation before output rounding. Attention computes full-key softmax in query
+blocks, with scratch storage per OpenMP thread instead of a full extra logits
+tensor. This is query-blocked attention, not an online/Flash Attention algorithm.
+Grid normalization/transposition and diffusion adaptive normalization/output
+conditioning retain their existing implementations. MSA and CrossAttention
+remain unchanged in this stage.
+
+Both flags accept `auto`, `torch`, and `cpp`. `auto` preserves the earlier choices;
+`torch` selects the preserved PyTorch path. Each flag is independent of
+`--glu_backend`, `--cpu_precision`, and the LayerNorm backend. All native operators
+are CPU inference-only, require the rebuilt Linux x86_64 optional package, and
+raise explicit errors rather than silently falling back. Parameter names,
+initialization order, and checkpoint layouts are unchanged.
+
+After rebuilding `./af3_kernels` on the cluster, compare these settings under
+both `--cpu_precision=fp32` and `bf16`, using otherwise identical inputs, seeds,
+sample counts, and CPU/thread settings:
+
+| Comparison | Backend flags |
+| --- | --- |
+| Full PyTorch baseline | `--glu_backend=torch --triangle_backend=torch --attention_backend=torch` |
+| Triangle only | `--glu_backend=torch --triangle_backend=cpp --attention_backend=torch` |
+| Attention only | `--glu_backend=torch --triangle_backend=torch --attention_backend=cpp` |
+| Combined stages 4–6 | `--glu_backend=cpp --triangle_backend=cpp --attention_backend=cpp` |
+
+```bash
+python run_alphafold.py \
+    --device=cpu --cpu_precision=bf16 \
+    --glu_backend=cpp --triangle_backend=cpp --attention_backend=cpp \
+    --run_data_pipeline=False \
+    --json_path=./fold_input_data.json \
+    --model_dir=$PATH_TO_AF3_MODEL \
+    --output_dir=./output_cpu_bf16_cpp_all
+```
+
+The original PyTorch functions are retained for comparisons, including their
+finite `-1e9` attention mask semantics: fully masked rows produce a uniform
+softmax over the real keys. Native attention preserves that behavior, supports
+broadcastable bias/masks and unequal query/key lengths, and does not replace NaN
+results with zeros. BF16 padding adds zero probabilities only for internal PV
+packing. Stored model parameters remain FP32; converted contiguous weight copies
+reuse the stage 4 mutation-aware cache. Packed weights still refresh per call.
+
+Only source checks run on the Mac. Native compilation, dtype/layout correctness,
+operator/module numerical errors, full inference, memory consumption, and AMX
+execution/performance still require validation on the target cluster. See the
+[expanded cluster checklist](af3_kernels/README.md).
+
 ## Acknowledgments
 
 The xfold source code is licensed under the Apache License, Version 2.0.
