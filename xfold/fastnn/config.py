@@ -1,4 +1,4 @@
-# options: ["torch", "triton"]
+# options: ["torch", "triton", "ipex"] (ipex: optional Linux x86_64 CPU dependency)
 layer_norm_implementation = "torch"
 
 # options: ["torch", "triton", "cpp"]

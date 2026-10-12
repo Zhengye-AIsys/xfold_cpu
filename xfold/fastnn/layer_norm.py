@@ -57,6 +57,14 @@ class LayerNorm(nn.Module):
             return F.layer_norm(
                 input, self.normalized_shape, self.weight, self.bias, self.eps
             )
+        elif fastnn_config.layer_norm_implementation == "ipex":
+            if self.training:
+                raise RuntimeError('IPEX LayerNorm supports eval inference only.')
+            from ._ipex_layer_norm import layer_norm_ipex
+
+            return layer_norm_ipex(
+                input, self.normalized_shape, self.weight, self.bias, self.eps
+            )
         elif fastnn_config.layer_norm_implementation == "triton":
             if input.device.type != 'cuda':
                 raise ValueError('Triton LayerNorm requires CUDA tensors.')
@@ -68,7 +76,7 @@ class LayerNorm(nn.Module):
             return fast_out
         else:
             raise ValueError(
-                "layer_norm_implementation must be 'torch' or 'triton', "
+                "layer_norm_implementation must be 'torch', 'triton' or 'ipex', "
                 f"got {fastnn_config.layer_norm_implementation}"
             )
 

@@ -312,6 +312,43 @@ capacity limits and exception cleanup. Use fresh processes for memory/timing
 comparisons. Mac static checks do not establish accuracy or performance; see the
 [stage 7 cluster checklist](af3_kernels/README.md).
 
+### IPEX LayerNorm and CPU runtime configuration (stage 8)
+
+`--layer_norm_backend=auto|torch|ipex` selects LayerNorm independently of
+GLU/Triangle/Attention, precision and caching. `auto` preserves PyTorch CPU and
+the existing fastnn CUDA selection; `torch` selects the original PyTorch
+implementation. `ipex` explicitly loads the optional Linux x86_64 CPU dependency
+and checks `ipex.llm.functional.fast_layer_norm` before model construction.
+Missing/incompatible dependencies fail clearly. Stored parameters, checkpoint
+keys and FP32/BF16 autocast behavior remain unchanged. IPEX is not a required
+dependency, and no whole-model optimization, tracing or compilation is enabled.
+Native Triangle's internal normalizations still call ATen directly.
+
+`--cpu_threads` and `--cpu_interop_threads` are optional positive integer CPU
+settings. Unset values preserve runtime defaults. Settings are applied before
+model/weight construction; an initialized inter-op pool requires a fresh process
+for a differing value. Startup logs record PyTorch counts, allowed CPUs (when
+available), and OpenMP/MKL affinity environment settings.
+
+Use `scripts/run_cpu.sh` on the cluster to apply OpenMP/MKL thread counts, optional
+core/NUMA binding and explicit shared-library preloads before Python starts:
+
+```bash
+# Inspect the command only. 8 is an illustration, not a cluster tuning result.
+XFOLD_CPU_THREADS=8 XFOLD_CPU_INTEROP_THREADS=1 \
+  bash scripts/run_cpu.sh --dry-run \
+    --cpu_precision=bf16 --layer_norm_backend=torch \
+    --json_path=./fold_input_data.json \
+    --model_dir="$PATH_TO_AF3_MODEL" --output_dir=./output_stage8_torch
+```
+
+Run the same command on the target cluster without `--dry-run`; change
+`--layer_norm_backend=ipex` and the output directory for the IPEX comparison.
+Strict backend comparisons use fresh processes because importing IPEX registers
+process-wide PyTorch operators. Numerical accuracy and speed are unvalidated on
+this Mac. Configuration examples, API sources, topology/runtime considerations,
+and the later cluster checklist are in [the stage 8 guide](docs/stage8_cpu.md).
+
 ## Acknowledgments
 
 The xfold source code is licensed under the Apache License, Version 2.0.

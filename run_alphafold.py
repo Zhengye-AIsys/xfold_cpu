@@ -112,6 +112,23 @@ _CPU_PRECISION = flags.DEFINE_enum(
     'Select --device=cpu when comparing these modes.',
 )
 
+_LAYER_NORM_BACKEND = flags.DEFINE_enum(
+    'layer_norm_backend', 'auto', ['auto', 'torch', 'ipex'],
+    'LayerNorm backend. auto preserves PyTorch CPU / fastnn CUDA behavior; '
+    'torch explicitly selects PyTorch; ipex selects optional Linux x86_64 '
+    'CPU IPEX functional LayerNorm. Native Triangle internal norms remain ATen.',
+)
+_CPU_THREADS = flags.DEFINE_integer(
+    'cpu_threads', None,
+    'Positive PyTorch CPU intra-op thread count; unset preserves runtime defaults. '
+    'Use scripts/run_cpu.sh to also set OpenMP/MKL before Python starts.',
+)
+_CPU_INTEROP_THREADS = flags.DEFINE_integer(
+    'cpu_interop_threads', None,
+    'Positive PyTorch CPU inter-op thread count; unset preserves runtime defaults. '
+    'Set before model construction; changing an initialized pool needs a fresh process.',
+)
+
 _USE_FASTNN = flags.DEFINE_bool(
     'fastnn',
     True,
@@ -266,6 +283,9 @@ class ModelRunner:
         attention_backend: str = 'auto',
         cache_mode: str = 'off',
         input_cache_max_mb: int = 512,
+        layer_norm_backend: str = 'auto',
+        cpu_threads: int | None = None,
+        cpu_interop_threads: int | None = None,
     ):
         self._model_dir = model_dir
         self._device = torch.device(device)
@@ -288,6 +308,19 @@ class ModelRunner:
             raise ValueError('Cache mode must be off, weights, inputs, or all.')
         if not isinstance(input_cache_max_mb, int) or input_cache_max_mb < 0:
             raise ValueError('Input cache budget must be a nonnegative integer MiB value.')
+
+        if layer_norm_backend not in ('auto', 'torch', 'ipex'):
+            raise ValueError('LayerNorm backend must be auto, torch, or ipex.')
+        if self._device.type != 'cpu' and (cpu_threads is not None or cpu_interop_threads is not None):
+            raise ValueError('CPU thread flags require --device=cpu.')
+        if layer_norm_backend == 'ipex' and self._device.type != 'cpu':
+            raise ValueError('--layer_norm_backend=ipex requires --device=cpu.')
+        if self._device.type == 'cpu':
+            from xfold.cpu_runtime import configure_cpu_threads
+            configure_cpu_threads(cpu_threads, cpu_interop_threads)
+        if layer_norm_backend == 'ipex':
+            from xfold.fastnn._ipex_layer_norm import load_ipex_layer_norm
+            load_ipex_layer_norm()
 
         if glu_backend not in ('auto', 'torch', 'cpp'):
             raise ValueError('GLU backend must be auto, torch, or cpp.')
@@ -325,7 +358,9 @@ class ModelRunner:
             'triton' if self._device.type == 'cuda' and _USE_FASTNN.value
             else 'torch'
         )
-        fastnn_config.layer_norm_implementation = implementation
+        fastnn_config.layer_norm_implementation = (
+            implementation if layer_norm_backend == 'auto' else layer_norm_backend)
+        print(f'LayerNorm backend: {fastnn_config.layer_norm_implementation}')
         fastnn_config.dot_product_attention_implementation = (
             implementation if attention_backend == 'auto' else attention_backend)
         fastnn_config.gated_linear_unit_implementation = (
@@ -739,6 +774,9 @@ def main(_):
             attention_backend=_ATTENTION_BACKEND.value,
             cache_mode=_CACHE_MODE.value,
             input_cache_max_mb=_INPUT_CACHE_MAX_MB.value,
+            layer_norm_backend=_LAYER_NORM_BACKEND.value,
+            cpu_threads=_CPU_THREADS.value,
+            cpu_interop_threads=_CPU_INTEROP_THREADS.value,
         )
     else:
         print('Skipping running model inference.')

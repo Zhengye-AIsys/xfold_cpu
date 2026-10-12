@@ -1,0 +1,18 @@
+# Copy to your own file and select it with XFOLD_CPU_ENV_FILE=/absolute/path.
+# Empty counts preserve runtime defaults. Use CPUs assigned by the scheduler;
+# these illustrative values are not a topology recommendation.
+XFOLD_CPU_PYTHON=python
+XFOLD_CPU_THREADS=
+XFOLD_CPU_INTEROP_THREADS=
+
+# Choose an exact CPU list OR CPUs belonging to NUMA nodes; empty inherits cpuset.
+XFOLD_CPU_CPUS=
+XFOLD_CPU_NODES=
+XFOLD_CPU_MEM_POLICY=inherit  # inherit | bind | interleave | local
+XFOLD_CPU_MEM_NODES=
+XFOLD_CPU_AFFINITY=inherit    # inherit | compact | spread | none
+
+# Intel OpenMP options/preloads are optional; match your PyTorch/native runtime.
+XFOLD_CPU_KMP_BLOCKTIME=
+XFOLD_CPU_OMP_LIBRARY=
+XFOLD_CPU_ALLOCATOR_LIBRARY=

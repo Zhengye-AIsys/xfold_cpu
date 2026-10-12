@@ -133,7 +133,8 @@ class CPUStaticTests(unittest.TestCase):
                 "implementation if glu_backend == 'auto' else glu_backend"
                 if backend == 'gated_linear_unit' else
                 "implementation if attention_backend == 'auto' else attention_backend"
-                if backend == 'dot_product_attention' else 'implementation'
+                if backend == 'dot_product_attention' else
+                "implementation if layer_norm_backend == 'auto' else layer_norm_backend"
             )
             self.assertEqual(ast.unparse(assignment.value), expected)
             self.assertLess(assignment.lineno, model_creation.lineno)
