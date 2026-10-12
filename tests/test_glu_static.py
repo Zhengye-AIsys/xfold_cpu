@@ -78,7 +78,7 @@ def gated_linear_unit_torch(x, weight):
         self.assertLess(dtype.lineno, region.lineno)
         context = region.items[0].context_expr
         self.assertEqual(keywords(context), {'device_type': "'cpu'", 'enabled': 'False'})
-        self.assertEqual(len(calls(region, 'extension.gated_linear_unit')), 1)
+        self.assertEqual(len(calls(region, 'extension.gated_linear_unit')), 2)
         self.assertIn('x.detach().resolve_conj().resolve_neg().to(dtype=dtype).contiguous()', ast.unparse(region))
         self.assertIn('weight_cache.prepare(weight, dtype)', ast.unparse(region))
         self.assertFalse(calls(bridge, 'copy_'))
@@ -117,7 +117,7 @@ def gated_linear_unit_torch(x, weight):
         prepare = next(node for node in cache.body if getattr(node, 'name', None) == 'prepare')
         handler = next(node for node in prepare.body if isinstance(node, ast.Try)).handlers[0]
         self.assertEqual(ast.unparse(handler.type), 'RuntimeError')
-        self.assertIn('self._key = self._source = self._weight = None', ast.unparse(handler))
+        self.assertIn('self._key = self._source = self._weight = self._packed = None', ast.unparse(handler))
         self.assertEqual(ast.unparse(handler.body[-1]),
                          'return weight.detach().to(dtype=dtype).contiguous()')
 
@@ -146,7 +146,8 @@ def gated_linear_unit_torch(x, weight):
             'af3_detail::check_tensor(x)', 'af3_detail::check_tensor(weight)',
             'x.dim() >= 1 && weight.dim() == 2',
             'x.is_contiguous() && weight.is_contiguous()',
-            'x.scalar_type() == weight.scalar_type()', 'x.size(-1) == weight.size(0)',
+            'x.scalar_type() == weight.scalar_type()',
+            'weight.size(0) == static_cast<int64_t>(k) + (weight_packed ? k % 2 : 0)',
             'weight_stride % 2 == 0', 'xsmm_size(m_block)', 'xsmm_size(n_block)',
             'auto shape = x.sizes().vec()', 'shape.back() = n', 'if (m == 0) return output',
             'static_cast<int64_t>(k) + k % 2', 'vnni_repack_tensor(right, 2, 0)',

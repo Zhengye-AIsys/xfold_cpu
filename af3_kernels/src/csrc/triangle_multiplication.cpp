@@ -9,17 +9,18 @@ at::Tensor xsmm_triangle_multiplication(
     const at::Tensor& projection, const at::Tensor& gate,
     const at::Tensor& center_weight, const c10::optional<at::Tensor>& center_bias,
     const at::Tensor& output_weight, const at::Tensor& gating_weight,
-    double left_eps, double center_eps, int64_t block_size) {
+    double left_eps, double center_eps, int64_t block_size, bool weights_packed) {
     af3_detail::check_tensor(pair);
     TORCH_CHECK(pair.dim() == 3 && pair.size(0) == pair.size(1) && pair.is_contiguous(),
                 "Triangle input must be contiguous [N, N, C].");
     const int64_t n = pair.size(0), c = af3_detail::xsmm_size(pair.size(2));
     af3_detail::xsmm_size(block_size);
+    TORCH_CHECK(!weights_packed || projection.scalar_type() == at::kBFloat16, "Packed Triangle weights require BF16.");
     TORCH_CHECK(std::isfinite(left_eps) && left_eps >= 0.0 && std::isfinite(center_eps) && center_eps >= 0.0,
                 "LayerNorm eps must be finite and nonnegative.");
     for (const auto& weight : {projection, gate, output_weight, gating_weight}) {
         af3_detail::check_tensor(weight);
-        TORCH_CHECK(weight.dim() == 2 && weight.size(0) == c && weight.is_contiguous() &&
+        TORCH_CHECK(weight.dim() == 2 && weight.size(0) == c + (weights_packed ? c % 2 : 0) && weight.is_contiguous() &&
                     weight.scalar_type() == projection.scalar_type(), "Invalid Triangle projection weight.");
     }
     TORCH_CHECK(projection.size(1) == 2 * c && gate.size(1) == 2 * c &&
@@ -45,10 +46,10 @@ at::Tensor xsmm_triangle_multiplication(
                     .to(projection.scalar_type()).contiguous().view({n * n, c});
     at::Tensor contracted;
     {
-        auto projected = af3_detail::tiled_matmul(flat, projection, c10::nullopt, block_size, block_size)
+        auto projected = af3_detail::tiled_matmul(flat, projection, c10::nullopt, block_size, block_size, weights_packed)
                          .view({n, n, 2 * c}).permute({2, 0, 1});
         if (mask.has_value()) projected.mul_(mask->unsqueeze(0));
-        auto gate_values = af3_detail::tiled_matmul(flat, gate, c10::nullopt, block_size, block_size)
+        auto gate_values = af3_detail::tiled_matmul(flat, gate, c10::nullopt, block_size, block_size, weights_packed)
                            .view({n, n, 2 * c}).permute({2, 0, 1});
         projected.mul_(at::sigmoid(gate_values));
         // Original reshape groups adjacent channels: a_c = projected[2*c], b_c = projected[2*c+1].
@@ -64,8 +65,8 @@ at::Tensor xsmm_triangle_multiplication(
     auto centered = at::layer_norm(contracted, {c}, center_weight, center_bias, center_eps, true)
                         .to(projection.scalar_type()).contiguous().view({n * n, c});
     contracted = at::Tensor();
-    auto result = af3_detail::tiled_matmul(centered, output_weight, c10::nullopt, block_size, block_size);
-    auto output_gate = af3_detail::tiled_matmul(flat, gating_weight, c10::nullopt, block_size, block_size);
+    auto result = af3_detail::tiled_matmul(centered, output_weight, c10::nullopt, block_size, block_size, weights_packed);
+    auto output_gate = af3_detail::tiled_matmul(flat, gating_weight, c10::nullopt, block_size, block_size, weights_packed);
     result.mul_(at::sigmoid(output_gate));
     // Return the update only. Pairformer owns the residual addition.
     return result.view({n, n, c});

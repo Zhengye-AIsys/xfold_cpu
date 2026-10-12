@@ -152,7 +152,8 @@ class ExtensionStaticTests(unittest.TestCase):
         })
         for name in names:
             function = next(node for node in self.package.body if getattr(node, 'name', None) == name)
-            self.assertEqual(len(calls(function, f'load_extension().{name}')), 1)
+            expected = 2 if name in ('linear', 'gated_linear_unit', 'triangle_multiplication') else 1
+            self.assertEqual(len(calls(function, f'load_extension().{name}')), expected)
         self.assertNotIn('attention', names)
 
     def test_native_libxsmm_api_names_exist_in_pinned_headers(self):

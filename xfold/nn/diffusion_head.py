@@ -19,6 +19,7 @@ from xfold.nn.diffusion_transformer import DiffusionTransformer, DiffusionTransi
 from xfold.nn.atom_cross_attention import AtomCrossAttEncoder, AtomCrossAttDecoder
 
 from xfold import fastnn
+from xfold.nn.cache import InputCache
 
 # Carefully measured by averaging multimer training set.
 SIGMA_DATA = 16.0
@@ -140,6 +141,7 @@ class DiffusionHead(nn.Module):
         self.atom_cross_att_decoder = AtomCrossAttDecoder()
 
         self.fourier_embeddings = FourierEmbeddings(dim=256)
+        self._input_cache = InputCache()
 
     def _conditioning(
         self,
@@ -148,6 +150,28 @@ class DiffusionHead(nn.Module):
         noise_level: torch.Tensor,
         use_conditioning: bool,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        single_cond, pair_cond = self._input_cache.get(
+            'conditioning', (batch.token_features, embeddings, use_conditioning), self,
+            lambda: self._static_conditioning(batch, embeddings, use_conditioning),
+            modules=(self.pair_cond_initial_norm, self.pair_cond_initial_projection,
+                     self.pair_transition_0, self.pair_transition_1,
+                     self.single_cond_initial_norm, self.single_cond_initial_projection),
+            copy=lambda value: (value[0].clone(), value[1]))
+
+        noise_embedding = self.fourier_embeddings(
+            (1 / 4) * torch.log(noise_level / SIGMA_DATA)
+        )
+
+        single_cond += self.noise_embedding_initial_projection(
+            self.noise_embedding_initial_norm(noise_embedding)
+        )
+
+        single_cond += self.single_transition_0(single_cond)
+        single_cond += self.single_transition_1(single_cond)
+
+        return single_cond, pair_cond
+
+    def _static_conditioning(self, batch, embeddings, use_conditioning):
         single_embedding = use_conditioning * embeddings['single']
         pair_embedding = use_conditioning * embeddings['pair']
 
@@ -168,17 +192,6 @@ class DiffusionHead(nn.Module):
             [single_embedding, target_feat], dim=-1)
         single_cond = self.single_cond_initial_projection(
             self.single_cond_initial_norm(features_1d))
-
-        noise_embedding = self.fourier_embeddings(
-            (1 / 4) * torch.log(noise_level / SIGMA_DATA)
-        )
-
-        single_cond += self.noise_embedding_initial_projection(
-            self.noise_embedding_initial_norm(noise_embedding)
-        )
-
-        single_cond += self.single_transition_0(single_cond)
-        single_cond += self.single_transition_1(single_cond)
 
         return single_cond, pair_cond
 

@@ -9,6 +9,7 @@ namespace py = pybind11;
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
     libxsmm_init();
+    module.attr("packed_weight_api") = 1;
     module.def("runtime_info", []() {
         py::dict info;
         info["libxsmm_revision"] = XFOLD_LIBXSMM_REVISION;
@@ -26,9 +27,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
     module.def("gated_linear_unit", &xsmm_gated_linear_unit,
                py::arg("x"), py::arg("weight"),
                py::arg("M_BLK") = 128, py::arg("N_BLK") = 128,
+               py::arg("weight_packed") = false,
                py::call_guard<py::gil_scoped_release>());
     module.def("linear", &xsmm_linear, py::arg("x"), py::arg("weight"),
-               py::arg("bias") = py::none(), py::call_guard<py::gil_scoped_release>());
+               py::arg("bias") = py::none(), py::arg("weight_packed") = false,
+               py::call_guard<py::gil_scoped_release>());
     module.def("triangle_multiplication", &xsmm_triangle_multiplication,
                py::arg("pair"), py::arg("mask"), py::arg("outgoing"),
                py::arg("left_weight"), py::arg("left_bias"),
@@ -36,7 +39,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
                py::arg("center_weight"), py::arg("center_bias"),
                py::arg("output_weight"), py::arg("gating_weight"),
                py::arg("left_eps") = 1e-5, py::arg("center_eps") = 1e-5,
-               py::arg("block_size") = 128, py::call_guard<py::gil_scoped_release>());
+               py::arg("block_size") = 128, py::arg("weights_packed") = false,
+               py::call_guard<py::gil_scoped_release>());
     module.def("dot_product_attention", &xsmm_dot_product_attention,
                py::arg("q"), py::arg("k"), py::arg("v"),
                py::arg("mask") = py::none(), py::arg("bias") = py::none(),

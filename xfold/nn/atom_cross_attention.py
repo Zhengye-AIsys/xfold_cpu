@@ -22,6 +22,7 @@ from xfold.nn import atom_layout, utils
 from xfold.nn.diffusion_transformer import DiffusionCrossAttTransformer
 
 from xfold import fastnn
+from xfold.nn.cache import InputCache
 
 
 @dataclasses.dataclass(frozen=True)
@@ -130,6 +131,8 @@ class AtomCrossAttEncoder(nn.Module):
             self.embed_trunk_pair_cond = nn.Linear(
                 self.c_trunk_pair_cond, self.per_atom_pair_channels, bias=False)
 
+        self._input_cache = InputCache()
+
     def _per_atom_conditioning(self, batch: feat_batch.Batch) -> tuple[torch.Tensor, torch.Tensor]:
 
         # Compute per-atom single conditioning
@@ -190,6 +193,71 @@ class AtomCrossAttEncoder(nn.Module):
         assert (trunk_single_cond is not None) == self.with_trunk_single_cond
         assert (trunk_pair_cond is not None) == self.with_trunk_pair_cond
 
+        factory = lambda: self._static_conditioning(batch, trunk_single_cond, trunk_pair_cond)
+        # The trunk's encoder is called once; reserve capacity for repeated denoising.
+        if self.with_token_atoms_act:
+            conditioning = self._input_cache.get(
+                'atom_conditioning', (batch.ref_structure, batch.predicted_structure_info,
+                                      batch.atom_cross_att, trunk_single_cond, trunk_pair_cond), self,
+                factory,
+                modules=tuple(module for name, module in self.named_children()
+                              if name not in ('atom_positions_to_features', 'atom_transformer_encoder',
+                                              'project_atom_features_for_aggr')))
+        else:
+            conditioning = factory()
+        (queries_single_cond, queries_mask, keys_single_cond, keys_mask,
+         pair_act, token_atoms_mask) = conditioning
+
+        if token_atoms_act is None:
+            queries_act = queries_single_cond.clone()
+        else:
+            # Convert token_atoms_act to queries layout and map to per_atom_channels
+            # (num_subsets, num_queries, channels)
+            queries_act = atom_layout.convert(
+                batch.atom_cross_att.token_atoms_to_queries,
+                token_atoms_act,
+                layout_axes=(-3, -2),
+            )
+
+            queries_act = self.atom_positions_to_features(queries_act)
+            queries_act *= queries_mask[..., None]
+            queries_act += queries_single_cond
+
+        queries_act = self.atom_transformer_encoder(
+            queries_act=queries_act,
+            queries_mask=queries_mask,
+            queries_to_keys=batch.atom_cross_att.queries_to_keys,
+            keys_mask=keys_mask,
+            queries_single_cond=queries_single_cond,
+            keys_single_cond=keys_single_cond,
+            pair_cond=pair_act
+        )
+
+        queries_act *= queries_mask[..., None]
+        skip_connection = queries_act.clone()
+
+        queries_act = self.project_atom_features_for_aggr(queries_act)
+
+        token_atoms_act = atom_layout.convert(
+            batch.atom_cross_att.queries_to_token_atoms,
+            queries_act,
+            layout_axes=(-3, -2),
+        )
+
+        token_act = utils.mask_mean(
+            token_atoms_mask[..., None], torch.relu(token_atoms_act), dim=-2
+        )
+
+        return AtomCrossAttEncoderOutput(
+            token_act=token_act,
+            skip_connection=skip_connection,
+            queries_mask=queries_mask,
+            queries_single_cond=queries_single_cond,
+            keys_mask=keys_mask,
+            keys_single_cond=keys_single_cond,
+            pair_cond=pair_act,
+        )
+    def _static_conditioning(self, batch, trunk_single_cond, trunk_pair_cond):
         token_atoms_single_cond, _ = self._per_atom_conditioning(batch)
         token_atoms_mask = batch.predicted_structure_info.atom_mask
 
@@ -214,21 +282,6 @@ class AtomCrossAttEncoder(nn.Module):
                 trunk_single_cond,
                 layout_axes=(-2,),
             )
-
-        if token_atoms_act is None:
-            queries_act = queries_single_cond.clone()
-        else:
-            # Convert token_atoms_act to queries layout and map to per_atom_channels
-            # (num_subsets, num_queries, channels)
-            queries_act = atom_layout.convert(
-                batch.atom_cross_att.token_atoms_to_queries,
-                token_atoms_act,
-                layout_axes=(-3, -2),
-            )
-
-            queries_act = self.atom_positions_to_features(queries_act)
-            queries_act *= queries_mask[..., None]
-            queries_act += queries_single_cond
 
         keys_single_cond = atom_layout.convert(
             batch.atom_cross_att.queries_to_keys,
@@ -325,40 +378,8 @@ class AtomCrossAttEncoder(nn.Module):
         pair_act2 = self.pair_mlp_2(torch.relu(pair_act2))
         pair_act += self.pair_mlp_3(torch.relu(pair_act2))
 
-        queries_act = self.atom_transformer_encoder(
-            queries_act=queries_act,
-            queries_mask=queries_mask,
-            queries_to_keys=batch.atom_cross_att.queries_to_keys,
-            keys_mask=keys_mask,
-            queries_single_cond=queries_single_cond,
-            keys_single_cond=keys_single_cond,
-            pair_cond=pair_act
-        )
-
-        queries_act *= queries_mask[..., None]
-        skip_connection = queries_act.clone()
-
-        queries_act = self.project_atom_features_for_aggr(queries_act)
-
-        token_atoms_act = atom_layout.convert(
-            batch.atom_cross_att.queries_to_token_atoms,
-            queries_act,
-            layout_axes=(-3, -2),
-        )
-
-        token_act = utils.mask_mean(
-            token_atoms_mask[..., None], torch.relu(token_atoms_act), dim=-2
-        )
-
-        return AtomCrossAttEncoderOutput(
-            token_act=token_act,
-            skip_connection=skip_connection,
-            queries_mask=queries_mask,
-            queries_single_cond=queries_single_cond,
-            keys_mask=keys_mask,
-            keys_single_cond=keys_single_cond,
-            pair_cond=pair_act,
-        )
+        return (queries_single_cond, queries_mask, keys_single_cond, keys_mask,
+                pair_act, token_atoms_mask)
 
 
 class AtomCrossAttDecoder(nn.Module):

@@ -1,9 +1,9 @@
-# Optional C++ / LIBXSMM CPU operators (stages 3–6)
+# Optional C++ / LIBXSMM CPU operators (stages 3–7)
 
 This is a separate, optional package. Installing or importing xfold does not build,
 load, or require it. Stage 3 added tools; stage 4 added opt-in GLU. Stages 5/6
 add opt-in Triangle Multiplication and Grid/SelfAttention. Default FP32/BF16 CPU
-inference still uses PyTorch. Package version 0.3.0 must be rebuilt on the cluster
+inference still uses PyTorch. Package version 0.4.0 must be rebuilt on the cluster
 to include the new bindings, even if an earlier stage is already installed.
 
 ## Source and build
@@ -112,6 +112,9 @@ the old backend selection, while `torch` and `cpp` select GLU explicitly. A `cpp
 request preflights loading before model/weight construction and rejects CUDA or
 an old extension without the GLU symbol. There is no automatic fallback.
 
+Stage 7 optionally extends these caches to retain VNNI2 weights; the default
+`off` mode preserves stage 4/5/6's per-call packing behavior.
+
 ## Triangle and Attention operators (stages 5–6)
 
 All new raw APIs require CPU inference tensors with resolved views and no
@@ -168,6 +171,58 @@ and owns stage 4 cache objects; no replacement class is selected at import time.
 the two families independently. `cpp` preflights the required native symbols
 before model/weight construction. PyTorch/CUDA defaults remain unchanged.
 
+## Cache lifecycle and packed weight ABI (stage 7)
+
+`--cache_mode=off|weights|inputs|all` selects caches independently of native
+operators. `off` is the default. `weights` reuses BF16 packed parameters in native
+GLU, Linear (including Grid/SelfAttention projections), and the four Triangle
+projections. Changing Q/K/V activations and contraction operands are not retained.
+FP32 stays on the ordinary path. Source version/storage/layout/dtype/device keys
+invalidate contiguous and packed copies; unversioned weights are packed without
+retention. Stored FP32 parameters and checkpoint keys remain unchanged.
+
+The 0.4.0 binding exposes `_C.packed_weight_api == 1`. GLU/Linear accept
+`weight_packed=False`; Triangle accepts `weights_packed=False`. True means BF16
+full-width VNNI2 (`BLK_SZ=0`) with original K zero-padded to the next even value.
+The packed tensor is opaque storage of shape `[K_padded, N]` (or `[K_padded, 2*N]`
+for GLU). Original input K is validated independently; inputs are padded and
+prepacked weights bypass conversion. Triangle contraction operands stay normal.
+The bridge requests True only for selected BF16 packed caches. Ordinary calls
+preserve earlier argument lists. Missing stage 7 markers are rejected before
+model construction when native packed caching is requested, and on direct packed
+cache use. Rebuild in the active target PyTorch environment; imports never build.
+
+Input caches use `xfold.nn.cache.InputCache` inside `input_cache_scope()`. Every
+AlphaFold3 call starts fresh and clears input data on exit, including exceptions.
+Recycle and diffusion phase boundaries release their feature caches too.
+`AlphaFold3.reset_input_cache()` clears feature caches while retaining weights.
+For standalone module comparisons, explicitly enter `input_cache_scope()` under
+`torch.inference_mode()` with eval modules; unscoped/gradient/training calls bypass
+input reuse.
+
+Cached components are initial recycle embeddings/masks/relative/bond features,
+diffusion static conditioning, diffusion/atom transformer pair logits, and atom
+encoder static conditioning/layout conversions. Dynamic positions, Fourier noise
+embedding, noise-conditioned single transitions, queries/key activations, MSA
+sampling and recycled updates remain uncached. Clone-before-update protects
+mutable initial activations and diffusion single conditioning; pair conditioning
+stays read-only. The trunk's one-shot atom encoder bypasses retention, preserving
+capacity for repeated denoising.
+
+Keys include scope, recursive dependency identities/versions/layouts, versioned
+parameters, LayerNorm eps/shape, head layout, precision and backend settings.
+Sources are retained to prevent allocator/id reuse. Versionless inference feature
+tensors are immutable within an explicit scope; reset caches before mutating
+them. Versionless parameters bypass reuse, and `.data`/external-storage writes
+bypass mutation tracking. Multiple input/seed model calls use fresh scopes.
+
+The example-wide quota defaults to 512 MiB (`--input_cache_max_mb`). Entries charge
+full backing storage, deduplicating aliases within one entry and conservatively
+charging aliases across entries. Replacement/reset releases quota. Entries that
+do not fit execute normally without retention. The limit excludes weight copies,
+existing inputs, scratch and transient storage. Packed caches retain contiguous
+and packed copies until invalidated; compare memory in fresh processes.
+
 ## Validation status
 
 On the development Mac, validation is source-only:
@@ -182,6 +237,8 @@ bridging, cache lifecycle, both Transition call sites, and edge-shape guards.
 Stages 5/6 also check explicit dispatch, preserved parameter modules, Triangle
 directions/interleaving/residual ownership, attention broadcast/scaling/masking,
 bias rounding, and bounded scratch allocation before parallel execution.
+Stage 7 adds scope/cleanup, training/gradient bypass, dependency/weight keys,
+capacity accounting, immutable/mutable boundaries and packed-weight guards.
 They do not compile the native extension or test GLU/GEMM/VNNI correctness.
 
 On the target cluster, validation should proceed in this order:
@@ -227,6 +284,27 @@ Additional stages 5/6 cluster validation:
    individually enabled before combining them with stage 4 GLU.
 5. Hold input/seeds/samples/threads fixed; record cold/warm timings and peak memory
    as well as output differences. Inspect generated kernels to verify AMX use.
+
+Additional stage 7 cluster validation:
+
+1. Rebuild 0.4.0 and verify the ABI marker. Compare cached/unpacked BF16 GLU,
+   Linear with bias, Triangle in both directions, and Grid/SelfAttention,
+   including odd K/output widths and block remainders. Confirm no double packing
+   or parameter/input mutation. Record numeric errors rather than assuming
+   bitwise equality from static checks.
+2. Compare `off`, `weights`, `inputs`, `all` at matching precision/backends. Reuse
+   one model for A → B → A and multiple seeds, including equal-length different
+   proteins; compare each with fresh models and the uncached path. Change trunk
+   embeddings and conditioning-enabled/disabled modes too.
+3. Reload/mutate tracked weights, move/change dtype, switch backend/LayerNorm eps,
+   call `reset_input_cache`, and force exceptions. Confirm feature data is released
+   while valid packed weights can persist across examples.
+4. Repeat with quotas 0/small/large and oversized pair logits. Recomputed paths
+   must preserve results. Training/gradient-enabled and standalone unscoped calls
+   must not retain input features.
+5. Record cold/warm timings and peak memory in separate processes. Include
+   signature checks, clones, packing and capacity effects before attributing
+   a performance or memory improvement.
 
 ## Attribution
 

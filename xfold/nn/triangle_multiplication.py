@@ -54,14 +54,19 @@ class TriangleMultiplication(nn.Module):
         dtype = compute_dtype(pair, *(getattr(self, name).weight for name in names))
         extension = load_native_operator('triangle_multiplication')
         with torch.amp.autocast(device_type='cpu', enabled=False):
-            weights = [self._native_weights[name].prepare(
-                getattr(self, name).weight.T.resolve_conj().resolve_neg(), dtype) for name in names]
-            return extension.triangle_multiplication(
+            packed = fastnn_config.packed_weight_cache_enabled and dtype == torch.bfloat16
+            weights = [
+                (self._native_weights[name].prepare_packed if packed else self._native_weights[name].prepare)(
+                    getattr(self, name).weight.T.resolve_conj().resolve_neg(), dtype) for name in names]
+            arguments = (
                 prepare_tensor(pair), prepare_tensor(mask), self.equation == 'cik,cjk->cij',
                 prepare_tensor(self.left_norm_input.weight), prepare_tensor(self.left_norm_input.bias),
                 *weights[:2], prepare_tensor(self.center_norm.weight), prepare_tensor(self.center_norm.bias),
                 *weights[2:], self.left_norm_input.eps, self.center_norm.eps,
             )
+            if packed:
+                return extension.triangle_multiplication(*arguments, weights_packed=True)
+            return extension.triangle_multiplication(*arguments)
 
     def _forward_torch(self, pair: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         """

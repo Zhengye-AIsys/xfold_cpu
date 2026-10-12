@@ -5,7 +5,7 @@ from importlib import import_module
 import platform
 
 
-__version__ = '0.3.0'
+__version__ = '0.4.0'
 __all__ = [
     'is_available', 'load_extension', 'runtime_info',
     'pad_and_align_tensor', 'vnni_repack_tensor', 'gemm', 'gated_linear_unit',
@@ -57,31 +57,39 @@ def gemm(a, b):
     return load_extension().gemm(a, b)
 
 
-def gated_linear_unit(x, weight, M_BLK=128, N_BLK=128):
+def gated_linear_unit(x, weight, M_BLK=128, N_BLK=128, weight_packed=False):
     """CPU inference GLU: [..., K] @ [K, 2*N], FP32/BF16 matching inputs.
 
     Returns [..., N] in the input dtype. This raw API does not implement autocast;
     the xfold bridge handles autocast, contiguous copies, and weight caching.
+    weight_packed=True requires full-width VNNI2 storage with K rounded up to even.
     """
+    if weight_packed:
+        return load_extension().gated_linear_unit(x, weight, M_BLK, N_BLK, True)
     return load_extension().gated_linear_unit(x, weight, M_BLK, N_BLK)
 
 
-def linear(x, weight, bias=None):
-    """Raw CPU inference Linear: [..., K] @ [K, N] + [N]; matching FP32/BF16."""
+def linear(x, weight, bias=None, weight_packed=False):
+    """Raw CPU inference Linear, matching FP32/BF16; packed weights are full-width VNNI2."""
+    if weight_packed:
+        return load_extension().linear(x, weight, bias, True)
     return load_extension().linear(x, weight, bias)
 
 
 def triangle_multiplication(
     pair, mask, outgoing, left_weight, left_bias, projection, gate,
     center_weight, center_bias, output_weight, gating_weight,
-    left_eps=1e-5, center_eps=1e-5, block_size=128,
+    left_eps=1e-5, center_eps=1e-5, block_size=128, weights_packed=False,
 ):
-    """Raw Triangle update, without residual addition. Linear weights are [K, N]."""
-    return load_extension().triangle_multiplication(
+    """Raw Triangle update; weights_packed applies to all four Linear weights."""
+    arguments = (
         pair, mask, outgoing, left_weight, left_bias, projection, gate,
         center_weight, center_bias, output_weight, gating_weight,
         left_eps, center_eps, block_size,
     )
+    if weights_packed:
+        return load_extension().triangle_multiplication(*arguments, True)
+    return load_extension().triangle_multiplication(*arguments)
 
 
 def dot_product_attention(q, k, v, mask=None, bias=None, query_block=128, q_pre_scaled=False):

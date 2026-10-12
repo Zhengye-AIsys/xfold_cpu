@@ -76,14 +76,16 @@ void run_glu(const at::Tensor& input, const at::Tensor& right, at::Tensor& outpu
 }  // namespace
 
 at::Tensor xsmm_gated_linear_unit(const at::Tensor& x, const at::Tensor& weight,
-                                 int64_t m_block, int64_t n_block) {
+                                 int64_t m_block, int64_t n_block, bool weight_packed) {
     af3_detail::check_tensor(x);
     af3_detail::check_tensor(weight);
     TORCH_CHECK(x.dim() >= 1 && weight.dim() == 2, "GLU expects [..., K] and [K, 2*N].");
     TORCH_CHECK(x.is_contiguous() && weight.is_contiguous(), "GLU inputs must be contiguous.");
     TORCH_CHECK(x.scalar_type() == weight.scalar_type(), "GLU input dtypes must match.");
-    TORCH_CHECK(x.size(-1) == weight.size(0), "GLU inner dimensions must match.");
-    const auto k = af3_detail::xsmm_size(weight.size(0));
+    TORCH_CHECK(!weight_packed || x.scalar_type() == at::kBFloat16, "Packed GLU weights require BF16.");
+    const auto k = af3_detail::xsmm_size(x.size(-1));
+    TORCH_CHECK(weight.size(0) == static_cast<int64_t>(k) + (weight_packed ? k % 2 : 0),
+                "GLU inner dimensions must match the normal/padded packed weight.");
     const auto weight_stride = af3_detail::xsmm_size(weight.size(1));
     TORCH_CHECK(weight_stride % 2 == 0, "GLU weight width must be positive and even.");
     const auto n = weight_stride / 2;
@@ -105,8 +107,10 @@ at::Tensor xsmm_gated_linear_unit(const at::Tensor& x, const at::Tensor& weight,
         // VNNI2 consumes pairs along K. Pad an odd K without changing results.
         inner = af3_detail::xsmm_size(static_cast<int64_t>(k) + k % 2);
         input = pad_and_align_tensor(input, {m, inner}, true, 0.0, 64);
-        right = pad_and_align_tensor(weight, {inner, weight_stride}, true, 0.0, 64);
-        right = vnni_repack_tensor(right, 2, 0);
+        if (!weight_packed) {
+            right = pad_and_align_tensor(weight, {inner, weight_stride}, true, 0.0, 64);
+            right = vnni_repack_tensor(right, 2, 0);
+        }
         dtype = LIBXSMM_DATATYPE_BF16;
         flags |= LIBXSMM_GEMM_FLAG_VNNI_A;
         run_glu<at::BFloat16>(input, right, output, m, inner, n, mb, nb, weight_stride, dtype, flags);

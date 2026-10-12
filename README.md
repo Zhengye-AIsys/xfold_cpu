@@ -247,6 +247,71 @@ operator/module numerical errors, full inference, memory consumption, and AMX
 execution/performance still require validation on the target cluster. See the
 [expanded cluster checklist](af3_kernels/README.md).
 
+### Repeated-computation caches (stage 7)
+
+Stage 7 adds independently selectable packed-weight and input caches. The default
+`--cache_mode=off` preserves prior behavior, including the earlier contiguous
+weight copies. Precision and PyTorch/native backend flags remain independent.
+
+| Mode | New caching behavior |
+| --- | --- |
+| `off` | Earlier stages' behavior |
+| `weights` | Persist BF16 VNNI2 weights for native GLU/Linear/Triangle |
+| `inputs` | Reuse immutable recycle/diffusion features within one model call |
+| `all` | Enable both |
+
+Packed weights refresh on source storage/version/layout/dtype/device changes.
+Odd K is padded before full-width packing, and native calls bypass repacking.
+Unversioned weights bypass reuse. FP32 and PyTorch operators do not use VNNI2.
+Packed copies use additional storage beyond parameters and contiguous copies.
+
+Input caches cover Evoformer initial pair/single embeddings, masks, relative
+encoding and bonds; diffusion static single/pair conditioning; transformer pair
+logits; and the denoising atom encoder's static conditioning, layouts and masks.
+Noise coordinates, noise-level embeddings, noise-conditioned single transitions,
+recycled activations, template processing and random MSA sampling keep executing.
+Mutable initial activations are cloned before in-place updates; immutable pair
+conditioning retains its identity for downstream caches.
+
+Every `AlphaFold3.forward` starts a new scope and clears input caches before and
+after inference, including exceptions. Recycle caches are released before
+diffusion, and diffusion caches before confidence calculation. Weight caches can
+persist. `model.reset_input_cache()` is also explicit. Keys use source identity,
+mutation counters and layout, parameter versions and LayerNorm settings, head
+layout, autocast and backend selection. Equal-shaped inputs do not share a cache
+merely because of shape. Training, gradient-enabled and unscoped calls bypass
+input reuse.
+
+Features must be immutable within an example scope. PyTorch inference tensors
+have no mutation counters, so these keys rely on identity plus scope boundaries
+for those features; call `reset_input_cache()` before changing them in place.
+Unversioned parameters are not cached. `.data`/external-storage weight writes
+remain unsupported by version-based keys. See the
+[PyTorch 2.6 inference-mode contract](https://raw.githubusercontent.com/pytorch/pytorch/v2.6.0/torch/autograd/grad_mode.py).
+
+`--input_cache_max_mb=512` sets the example-wide retained input-storage budget in
+MiB; `0` disables retention. Full backing storage is charged, including views.
+Entries that do not fit are recomputed. This budget excludes packed weights,
+existing model storage and temporary allocations, and does not bound process RSS.
+
+On the cluster, rebuild optional package 0.4.0 before using native packed weights,
+then compare the following flags with otherwise identical inference commands:
+
+```text
+--cache_mode=off
+--cache_mode=weights
+--cache_mode=inputs --input_cache_max_mb=512
+--cache_mode=all --input_cache_max_mb=512
+```
+
+Use PyTorch with `inputs` to isolate repeated-computation savings, then native
+BF16 with `weights`, then combine them. Hold input, seed, samples and threads
+fixed. Validate A → B → A on one reused model against fresh models, multiple seeds,
+changed conditioning, precision/backend switches, weight reloads, odd sizes,
+capacity limits and exception cleanup. Use fresh processes for memory/timing
+comparisons. Mac static checks do not establish accuracy or performance; see the
+[stage 7 cluster checklist](af3_kernels/README.md).
+
 ## Acknowledgments
 
 The xfold source code is licensed under the Apache License, Version 2.0.

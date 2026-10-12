@@ -140,6 +140,18 @@ _ATTENTION_BACKEND = flags.DEFINE_enum(
     'MSA/CrossAttention keep their existing implementation.',
 )
 
+_CACHE_MODE = flags.DEFINE_enum(
+    'cache_mode', 'off', ['off', 'weights', 'inputs', 'all'],
+    'Stage 7 inference caches: off preserves prior behavior; weights reuses '
+    'BF16 native VNNI weights; inputs caches immutable per-example conditioning; '
+    'all enables both. Cache choices are independent of operator backends.',
+)
+_INPUT_CACHE_MAX_MB = flags.DEFINE_integer(
+    'input_cache_max_mb', 512,
+    'Example-wide retained input-cache storage budget in MiB. 0 disables retention; '
+    'oversized values are recomputed. Packed weight caches use separate storage.',
+)
+
 # Binary paths.
 _JACKHMMER_BINARY_PATH = flags.DEFINE_string(
     'jackhmmer_binary_path',
@@ -252,6 +264,8 @@ class ModelRunner:
         glu_backend: str = 'auto',
         triangle_backend: str = 'auto',
         attention_backend: str = 'auto',
+        cache_mode: str = 'off',
+        input_cache_max_mb: int = 512,
     ):
         self._model_dir = model_dir
         self._device = torch.device(device)
@@ -270,6 +284,10 @@ class ModelRunner:
                 'Use --device=cpu to select the CPU explicitly.'
             )
         self._cpu_precision = cpu_precision
+        if cache_mode not in ('off', 'weights', 'inputs', 'all'):
+            raise ValueError('Cache mode must be off, weights, inputs, or all.')
+        if not isinstance(input_cache_max_mb, int) or input_cache_max_mb < 0:
+            raise ValueError('Input cache budget must be a nonnegative integer MiB value.')
 
         if glu_backend not in ('auto', 'torch', 'cpp'):
             raise ValueError('GLU backend must be auto, torch, or cpp.')
@@ -291,6 +309,17 @@ class ModelRunner:
                 from xfold.fastnn.native import load_native_operator
                 for operator in operators:
                     load_native_operator(operator)
+
+        if cache_mode in ('weights', 'all') and 'cpp' in (glu_backend, triangle_backend, attention_backend):
+            from xfold.fastnn.native import load_native_operator
+            extension = load_native_operator('gated_linear_unit')
+            if getattr(extension, 'packed_weight_api', 0) != 1:
+                raise RuntimeError('Rebuild af3_kernels for the stage 7 packed-weight API.')
+
+        fastnn_config.input_cache_enabled = cache_mode in ('inputs', 'all')
+        fastnn_config.packed_weight_cache_enabled = cache_mode in ('weights', 'all')
+        fastnn_config.input_cache_max_bytes = input_cache_max_mb * 1024 * 1024
+        print(f'Cache mode: {cache_mode}; input cache budget: {input_cache_max_mb} MiB')
 
         implementation = (
             'triton' if self._device.type == 'cuda' and _USE_FASTNN.value
@@ -708,6 +737,8 @@ def main(_):
             glu_backend=_GLU_BACKEND.value,
             triangle_backend=_TRIANGLE_BACKEND.value,
             attention_backend=_ATTENTION_BACKEND.value,
+            cache_mode=_CACHE_MODE.value,
+            input_cache_max_mb=_INPUT_CACHE_MAX_MB.value,
         )
     else:
         print('Skipping running model inference.')

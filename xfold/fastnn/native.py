@@ -1,6 +1,7 @@
 """Shared inference bridges; optional native code loads only on explicit use."""
 
 import torch
+from . import config
 
 
 def load_native_operator(name):
@@ -58,6 +59,11 @@ def linear_cpp(x, layer, weight_cache):
     extension = load_native_operator('linear')
     with torch.amp.autocast(device_type='cpu', enabled=False):
         weight = layer.weight.T.resolve_conj().resolve_neg()
+        packed = config.packed_weight_cache_enabled and dtype == torch.bfloat16
+        if packed:
+            return extension.linear(
+                prepare_tensor(x, dtype), weight_cache.prepare_packed(weight, dtype),
+                prepare_tensor(layer.bias, dtype), weight_packed=True)
         return extension.linear(
             prepare_tensor(x, dtype), weight_cache.prepare(weight, dtype),
             prepare_tensor(layer.bias, dtype),

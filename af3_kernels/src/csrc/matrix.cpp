@@ -65,17 +65,19 @@ void multiply(const at::Tensor& a, const at::Tensor& right, at::Tensor& output,
 namespace af3_detail {
 
 at::Tensor tiled_matmul(const at::Tensor& a, const at::Tensor& b,
-                       const c10::optional<at::Tensor>& bias, int64_t m_block, int64_t n_block) {
+                       const c10::optional<at::Tensor>& bias, int64_t m_block, int64_t n_block, bool b_packed) {
     check_tensor(a);
     check_tensor(b);
     TORCH_CHECK((a.dim() == 2 || a.dim() == 3) && a.dim() == b.dim(), "Matrix operands must be rank 2 or 3.");
     TORCH_CHECK(a.is_contiguous() && b.is_contiguous(), "Matrix operands must be contiguous.");
     TORCH_CHECK(a.scalar_type() == b.scalar_type(), "Matrix dtypes must match.");
-    TORCH_CHECK(a.size(-1) == b.size(-2), "Matrix inner dimensions must match.");
+    const auto k = xsmm_size(a.size(-1));
+    TORCH_CHECK(!b_packed || a.scalar_type() == at::kBFloat16, "Packed matrices require BF16.");
+    TORCH_CHECK(b.size(-2) == static_cast<int64_t>(k) + (b_packed ? k % 2 : 0),
+                "Matrix inner dimensions must match the normal/padded packed weight.");
     TORCH_CHECK(a.dim() == 2 || a.size(0) == b.size(0), "Matrix batch dimensions must match.");
     const int64_t batches = a.dim() == 3 ? a.size(0) : 1;
     const int64_t m = a.size(-2);
-    const auto k = xsmm_size(a.size(-1));
     const auto n = xsmm_size(b.size(-1));
     const auto requested_mb = xsmm_size(m_block), requested_nb = xsmm_size(n_block);
     if (bias.has_value()) {
@@ -88,15 +90,17 @@ at::Tensor tiled_matmul(const at::Tensor& a, const at::Tensor& b,
     auto output = aligned_empty(a, shape, 64);
     if (batches == 0 || m == 0) return output;
     auto input = a.view({batches, m, k});
-    auto right = b.view({batches, k, n});
+    auto right = b.view({batches, b.size(-2), n});
     auto inner = k;
     auto dtype = LIBXSMM_DATATYPE_F32;
     libxsmm_bitfield flags = LIBXSMM_GEMM_FLAG_BETA_0;
     if (a.scalar_type() == at::kBFloat16) {
         inner = xsmm_size(static_cast<int64_t>(k) + k % 2);
         input = pad_and_align_tensor(input, {batches, m, inner}, true, 0.0, 64);
-        right = pad_and_align_tensor(right, {batches, inner, n}, true, 0.0, 64);
-        right = vnni_repack_tensor(right.view({batches * inner, n}), 2, 0).view({batches, inner, n});
+        if (!b_packed) {
+            right = pad_and_align_tensor(right, {batches, inner, n}, true, 0.0, 64);
+            right = vnni_repack_tensor(right.view({batches * inner, n}), 2, 0).view({batches, inner, n});
+        }
         dtype = LIBXSMM_DATATYPE_BF16;
         flags |= LIBXSMM_GEMM_FLAG_VNNI_A;
     }
@@ -113,12 +117,12 @@ at::Tensor tiled_matmul(const at::Tensor& a, const at::Tensor& b,
 }  // namespace af3_detail
 
 at::Tensor xsmm_linear(const at::Tensor& x, const at::Tensor& weight,
-                       const c10::optional<at::Tensor>& bias) {
+                       const c10::optional<at::Tensor>& bias, bool weight_packed) {
     af3_detail::check_tensor(x);
     TORCH_CHECK(x.dim() >= 1 && x.is_contiguous(), "Linear input must be contiguous [..., K].");
-    TORCH_CHECK(weight.dim() == 2 && x.size(-1) == weight.size(0), "Linear weight must be [K, N].");
+    TORCH_CHECK(weight.dim() == 2, "Linear weight must be [K, N] or its padded packed layout.");
     const auto k = af3_detail::xsmm_size(x.size(-1));
-    auto output = af3_detail::tiled_matmul(x.view({x.numel() / k, k}), weight, bias);
+    auto output = af3_detail::tiled_matmul(x.view({x.numel() / k, k}), weight, bias, 128, 128, weight_packed);
     auto shape = x.sizes().vec();
     shape.back() = weight.size(1);
     return output.view(shape);

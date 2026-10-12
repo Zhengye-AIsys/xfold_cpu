@@ -19,6 +19,7 @@ from xfold.nn.head import DistogramHead, ConfidenceHead
 from xfold.nn.template import TemplateEmbedding
 from xfold.nn import atom_cross_attention
 from xfold.nn import diffusion_head
+from xfold.nn.cache import InputCache, clone_tensors, input_cache_scope, reset_input_cache
 
 
 class Evoformer(nn.Module):
@@ -68,10 +69,19 @@ class Evoformer(nn.Module):
 
         self.trunk_pairformer = nn.ModuleList(
             [PairformerBlock(with_single=True) for _ in range(self.pairformer_num_layer)])
+        self._input_cache = InputCache()
 
     def _relative_encoding(
         self, batch: feat_batch.Batch, pair_activations: torch.Tensor
     ) -> torch.Tensor:
+        relative = self._input_cache.get(
+            'relative', (batch.token_features, pair_activations.dtype, pair_activations.device), self,
+            lambda: self._relative_activations(batch, pair_activations.dtype),
+            modules=(self.position_activations,))
+        pair_activations += relative
+        return pair_activations
+
+    def _relative_activations(self, batch, dtype):
         max_relative_idx = 32
         max_relative_chain = 2
 
@@ -79,14 +89,19 @@ class Evoformer(nn.Module):
             batch.token_features,
             max_relative_idx,
             max_relative_chain,
-        ).to(dtype=pair_activations.dtype)
+        ).to(dtype=dtype)
 
-        pair_activations += self.position_activations(rel_feat)
-        return pair_activations
+        return self.position_activations(rel_feat)
 
     def _seq_pair_embedding(
         self, token_features: features.TokenFeatures, target_feat: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        return self._input_cache.get(
+            'sequence_pair', (token_features, target_feat), self,
+            lambda: self._seq_pair_embedding_uncached(token_features, target_feat),
+            modules=(self.left_single, self.right_single), copy=clone_tensors)
+
+    def _seq_pair_embedding_uncached(self, token_features, target_feat):
         """Generated Pair embedding from sequence."""
         left_single = self.left_single(target_feat)[:, None]
         right_single = self.right_single(target_feat)[None]
@@ -101,11 +116,19 @@ class Evoformer(nn.Module):
     def _embed_bonds(
         self, batch: feat_batch.Batch, pair_activations: torch.Tensor
     ) -> torch.Tensor:
+        bonds = self._input_cache.get(
+            'bonds', (batch.token_features, batch.polymer_ligand_bond_info,
+                      batch.ligand_ligand_bond_info, pair_activations.dtype, pair_activations.device), self,
+            lambda: self._bond_activations(batch, pair_activations.dtype, pair_activations.device),
+            modules=(self.bond_embedding,))
+        return pair_activations + bonds
+
+    def _bond_activations(self, batch, dtype, device):
         """Embeds bond features and merges into pair activations."""
         # Construct contact matrix.
         num_tokens = batch.token_features.token_index.shape[0]
         contact_matrix = torch.zeros(
-            (num_tokens, num_tokens), dtype=pair_activations.dtype, device=pair_activations.device)
+            (num_tokens, num_tokens), dtype=dtype, device=device)
 
         tokens_to_polymer_ligand_bonds = (
             batch.polymer_ligand_bond_info.tokens_to_polymer_ligand_bonds
@@ -143,7 +166,7 @@ class Evoformer(nn.Module):
 
         bonds_act = self.bond_embedding(contact_matrix[:, :, None])
 
-        return pair_activations + bonds_act
+        return bonds_act
 
     def _embed_template_pair(
         self,
@@ -230,7 +253,9 @@ class Evoformer(nn.Module):
             target_feat=target_feat,
         )
 
-        single_activations = self.single_activations(target_feat)
+        single_activations = self._input_cache.get(
+            'single', (target_feat,), self, lambda: self.single_activations(target_feat),
+            modules=(self.single_activations,), copy=clone_tensors)
         single_activations += self.prev_single_embedding(
             self.prev_single_embedding_layer_norm(prev['single']))
 
@@ -356,6 +381,17 @@ class AlphaFold3(nn.Module):
         return {'atom_positions': positions, 'mask': final_dense_atom_mask}
 
     def forward(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        self.reset_input_cache()
+        try:
+            with input_cache_scope():
+                return self._forward_impl(batch)
+        finally:
+            self.reset_input_cache()
+
+    def reset_input_cache(self):
+        reset_input_cache(self)
+
+    def _forward_impl(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         batch = feat_batch.Batch.from_data_dict(batch)
         num_res = batch.num_res
 
@@ -379,7 +415,10 @@ class AlphaFold3(nn.Module):
                 target_feat=target_feat
             )
 
+        # Recycle-only data no longer needs the example's shared cache budget.
+        self.reset_input_cache()
         samples = self._sample_diffusion(batch, embeddings)
+        self.reset_input_cache()
 
         confidence_output_per_sample = []
         for sample_dense_atom_position in samples['atom_positions']:

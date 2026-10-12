@@ -10,22 +10,42 @@ class GLUWeightCache:
         self._key = None
         self._source = None
         self._weight = None
+        self._packed = None
 
     def prepare(self, weight, dtype):
         try:
             version = weight._version
         except RuntimeError:
             # Inference tensors have no mutation counter; do not reuse their copies.
-            self._key = self._source = self._weight = None
+            self._key = self._source = self._weight = self._packed = None
             return weight.detach().to(dtype=dtype).contiguous()
         key = (weight.data_ptr(), version, tuple(weight.shape), tuple(weight.stride()),
                weight.dtype, weight.device, dtype)
         if self._key != key:
+            self._packed = None
             self._weight = weight.detach().to(dtype=dtype).contiguous()
             # Retain the source so allocator address reuse cannot produce a cache hit.
             self._source = weight
             self._key = key
         return self._weight
+
+    def prepare_packed(self, weight, dtype):
+        """Cache a full-width VNNI2 matrix, padding odd K; BF16 inference only."""
+        if dtype != torch.bfloat16:
+            raise ValueError('VNNI2 weight caches require BF16.')
+        matrix = self.prepare(weight, dtype)
+        if self._packed is not None:
+            return self._packed
+        extension = load_cpp_glu()
+        if getattr(extension, 'packed_weight_api', 0) != 1:
+            raise RuntimeError('Rebuild af3_kernels for the stage 7 packed-weight API.')
+        if matrix.size(0) % 2:
+            matrix = extension.pad_and_align_tensor(
+                matrix, (matrix.size(0) + 1, matrix.size(1)), True, 0.0, 64)
+        packed = extension.vnni_repack_tensor(matrix, 2, 0)
+        if self._key is not None:
+            self._packed = packed
+        return packed
 
 
 def load_cpp_glu():
@@ -60,10 +80,15 @@ def gated_linear_unit_cpp(x, weight, weight_cache=None):
     with torch.amp.autocast(device_type='cpu', enabled=False):
         native_x = x.detach().resolve_conj().resolve_neg().to(dtype=dtype).contiguous()
         weight = weight.resolve_conj().resolve_neg()
+        packed = (fastnn_config.packed_weight_cache_enabled and dtype == torch.bfloat16
+                  and weight_cache is not None)
         native_weight = (
+            weight_cache.prepare_packed(weight, dtype) if packed else
             weight_cache.prepare(weight, dtype) if weight_cache is not None
             else weight.detach().to(dtype=dtype).contiguous()
         )
+        if packed:
+            return extension.gated_linear_unit(native_x, native_weight, weight_packed=True)
         return extension.gated_linear_unit(native_x, native_weight)
 
 

@@ -21,6 +21,7 @@ from xfold.nn import atom_layout
 from xfold import fastnn
 from xfold.fastnn.gated_linear_unit import GLUWeightCache
 from xfold.fastnn import config as fastnn_config
+from xfold.nn.cache import InputCache
 
 
 class AdaptiveLayerNorm(nn.Module):
@@ -244,6 +245,7 @@ class DiffusionTransformer(nn.Module):
             [SelfAttention(self.c_act, self.c_single_cond, use_single_cond=True) for _ in range(self.num_blocks)])
         self.transition_block = nn.ModuleList(
             [DiffusionTransition(self.c_act, self.c_single_cond, use_single_cond=True) for _ in range(self.num_blocks)])
+        self._input_cache = InputCache()
 
     def forward(self,
                 act: torch.Tensor,
@@ -251,12 +253,16 @@ class DiffusionTransformer(nn.Module):
                 single_cond: torch.Tensor,
                 pair_cond:  torch.Tensor):
 
-        pair_act = self.pair_input_layer_norm(pair_cond)
+        pair_act = self._input_cache.get(
+            'pair_normalized', (pair_cond,), self, lambda: self.pair_input_layer_norm(pair_cond),
+            modules=(self.pair_input_layer_norm,))
 
         for super_block_i in range(self.num_super_blocks):
-            pair_logits = self.pair_logits_projection[super_block_i](pair_act)
-            pair_logits = einops.rearrange(
-                pair_logits, 'n s (b h) -> b h n s', h=self.num_head)
+            pair_logits = self._input_cache.get(
+                f'pair_logits_{super_block_i}', (pair_cond, self.num_head), self,
+                lambda: einops.rearrange(self.pair_logits_projection[super_block_i](pair_act),
+                                         'n s (b h) -> b h n s', h=self.num_head),
+                modules=(self.pair_input_layer_norm, self.pair_logits_projection[super_block_i]))
             for j in range(self.super_block_size):
                 act += self.self_attention[super_block_i * self.super_block_size + j](
                     act, mask, pair_logits[j, ...], single_cond)
@@ -364,6 +370,7 @@ class DiffusionCrossAttTransformer(nn.Module):
 
         self.transition_block = nn.ModuleList(
             [DiffusionTransition(c_x=self.c_query, c_single_cond=self.c_single_cond, use_single_cond=True) for _ in range(self.num_blocks)])
+        self._input_cache = InputCache()
 
     def forward(
         self,
@@ -376,11 +383,11 @@ class DiffusionCrossAttTransformer(nn.Module):
         pair_cond: torch.Tensor,  # (num_subsets, num_queries, num_keys, ch)
     ) -> torch.Tensor:
 
-        pair_act = self.pair_input_layer_norm(pair_cond)
-        pair_logits = self.pair_logits_projection(pair_act)
-
-        pair_logits = einops.rearrange(
-            pair_logits, 'n q k (b h) -> b n h q k', h=self.num_head)
+        pair_logits = self._input_cache.get(
+            'pair_logits', (pair_cond, self.num_head), self,
+            lambda: einops.rearrange(self.pair_logits_projection(self.pair_input_layer_norm(pair_cond)),
+                                     'n q k (b h) -> b n h q k', h=self.num_head),
+            modules=(self.pair_input_layer_norm, self.pair_logits_projection))
 
         for block_idx in range(self.num_blocks):
             keys_act = atom_layout.convert(
