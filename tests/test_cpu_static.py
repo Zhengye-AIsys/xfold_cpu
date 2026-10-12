@@ -148,18 +148,21 @@ class CPUStaticTests(unittest.TestCase):
         self.assertEqual(keywords(conversion.body)['dtype'], 'torch.float32')
         self.assertNotIn('dtype', keywords(conversion.orelse))
 
-    def test_autocast_and_synchronization_are_cuda_only(self):
+    def test_autocast_and_synchronization_use_the_selected_device(self):
         inference = self.method('run_inference')
-        contexts = [
-            node for node in ast.walk(inference) if isinstance(node, ast.IfExp)
-            and calls(node.body, 'torch.amp.autocast')
-        ]
-        self.assertEqual(len(contexts), 1)
-        self.assertEqual(ast.unparse(contexts[0].test), "self._device.type == 'cuda'")
-        self.assertEqual(ast.unparse(contexts[0].orelse), 'nullcontext()')
+        self.assertEqual(len(calls(inference, 'self._inference_context')), 1)
+        self.assertFalse(calls(inference, 'torch.amp.autocast'))
+        context = self.method('_inference_context')
+        cpu_branch = next(node for node in context.body if isinstance(node, ast.If))
+        self.assertEqual(ast.unparse(cpu_branch.test), "self._device.type == 'cpu'")
         autocast = calls(self.runner, 'torch.amp.autocast')
-        self.assertEqual(len(autocast), 1)
-        self.assertEqual(keywords(autocast[0])['dtype'], 'torch.bfloat16')
+        self.assertEqual(len(autocast), 2)
+        cpu_autocast = calls(cpu_branch, 'torch.amp.autocast')
+        self.assertEqual(len(cpu_autocast), 1)
+        self.assertEqual(keywords(cpu_autocast[0])['device_type'], "'cpu'")
+        cuda_autocast = next(node for node in autocast if node is not cpu_autocast[0])
+        self.assertEqual(keywords(cuda_autocast)['device_type'], "'cuda'")
+        self.assertEqual(keywords(cuda_autocast)['dtype'], 'torch.bfloat16')
         sync = self.method('synchronize')
         guard = next(node for node in sync.body if isinstance(node, ast.If))
         self.assertEqual(ast.unparse(guard.test), "self._device.type == 'cuda'")

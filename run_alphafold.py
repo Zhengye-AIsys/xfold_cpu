@@ -22,7 +22,6 @@ https://github.com/google-deepmind/alphafold3/blob/main/WEIGHTS_TERMS_OF_USE.md
 
 import random
 from collections.abc import Sequence
-from contextlib import nullcontext
 import csv
 import dataclasses
 import multiprocessing
@@ -101,7 +100,16 @@ _DEVICE = flags.DEFINE_enum(
     'auto',
     ['auto', 'cpu', 'cuda'],
     'Inference device. auto uses CUDA when available, otherwise CPU. '
-    'CPU inference uses FP32 and PyTorch operators.',
+    'CPU inference uses PyTorch operators and --cpu_precision.',
+)
+
+_CPU_PRECISION = flags.DEFINE_enum(
+    'cpu_precision',
+    'fp32',
+    ['fp32', 'bf16'],
+    'CPU inference precision. fp32 disables CPU autocast; bf16 enables '
+    'CPU BF16 autocast while retaining FP32 weights and floating-point inputs. '
+    'Select --device=cpu when comparing these modes.',
 )
 
 _USE_FASTNN = flags.DEFINE_bool(
@@ -219,6 +227,7 @@ class ModelRunner:
         self,
         model_dir: pathlib.Path,
         device: torch.device,
+        cpu_precision: str = 'fp32',
     ):
         self._model_dir = model_dir
         self._device = torch.device(device)
@@ -229,6 +238,14 @@ class ModelRunner:
                 'CUDA was requested but is unavailable. Use --device=cpu '
                 'or --device=auto.'
             )
+        if cpu_precision not in ('fp32', 'bf16'):
+            raise ValueError('CPU precision must be fp32 or bf16.')
+        if self._device.type != 'cpu' and cpu_precision != 'fp32':
+            raise ValueError(
+                '--cpu_precision=bf16 requires a CPU device. '
+                'Use --device=cpu to select the CPU explicitly.'
+            )
+        self._cpu_precision = cpu_precision
 
         implementation = (
             'triton' if self._device.type == 'cuda' and _USE_FASTNN.value
@@ -245,6 +262,22 @@ class ModelRunner:
 
         self._model = self._model.to(
             device=self._device, dtype=torch.float32)
+        if self._device.type == 'cpu':
+            print(
+                f'CPU precision: {self._cpu_precision}; '
+                'FP32 weights and floating-point inputs; '
+                f'BF16 autocast: {self._cpu_precision == "bf16"}'
+            )
+
+    def _inference_context(self):
+        """Choose computation precision without casting stored weights/features."""
+        if self._device.type == 'cpu':
+            return torch.amp.autocast(
+                device_type='cpu', dtype=torch.bfloat16,
+                enabled=self._cpu_precision == 'bf16',
+            )
+        return torch.amp.autocast(
+            device_type='cuda', dtype=torch.bfloat16)
 
     def synchronize(self) -> None:
         """Wait for inference work only when this runner uses CUDA."""
@@ -270,11 +303,7 @@ class ModelRunner:
         featurised_example['deletion_mean'] = featurised_example['deletion_mean'].to(
             dtype=torch.float32)
 
-        inference_context = (
-            torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16)
-            if self._device.type == 'cuda' else nullcontext()
-        )
-        with inference_context:
+        with self._inference_context():
             result = self._model(featurised_example)
             result['__identifier__'] = self._model.__identifier__.cpu().numpy()
 
@@ -623,6 +652,7 @@ def main(_):
         model_runner = ModelRunner(
             model_dir=pathlib.Path(_MODEL_DIR.value),
             device=device,
+            cpu_precision=_CPU_PRECISION.value,
         )
     else:
         print('Skipping running model inference.')

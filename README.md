@@ -43,8 +43,9 @@ python run_alphafold.py \
 
 `--device=auto` (the default) selects CUDA when available, otherwise CPU.
 Use `--device=cpu` to select the CPU explicitly, including on a CUDA host.
-CPU inference uses FP32 model weights and floating-point features with ordinary
-PyTorch operators. It does not enable BF16, LIBXSMM, IPEX, or distributed inference.
+CPU inference defaults to `--cpu_precision=fp32`, using FP32 model weights and
+floating-point features with ordinary PyTorch operators and CPU autocast disabled.
+It does not enable LIBXSMM, IPEX, or distributed inference.
 Integer indices and boolean masks retain their dtypes.
 
 For an input JSON that already includes MSA and template data:
@@ -52,6 +53,7 @@ For an input JSON that already includes MSA and template data:
 ```bash
 python run_alphafold.py \
     --device=cpu \
+    --cpu_precision=fp32 \
     --run_data_pipeline=False \
     --json_path=./fold_input_data.json \
     --model_dir=$PATH_TO_AF3_MODEL \
@@ -73,6 +75,48 @@ python -m unittest discover -s tests -p 'test_cpu_static.py' -v
 
 These are source-level checks only. Numerical accuracy, complete CPU inference,
 and performance must be validated separately on the target environment.
+
+### CPU BF16 mixed-precision baseline (stage 2)
+
+Set `--device=cpu --cpu_precision=bf16` to enable PyTorch CPU BF16 autocast for
+the model forward pass. Model weights and floating-point input features remain
+stored in FP32; integer indices and boolean masks are unchanged. PyTorch selects
+the execution dtype for eligible operations. This follows the
+[PyTorch CPU autocast approach](https://docs.pytorch.org/docs/2.6/amp.html).
+It is a mixed-precision baseline, not the explicit all-BF16 conversion in the
+reference `xfold_cpu` project.
+
+```bash
+python run_alphafold.py \
+    --device=cpu \
+    --cpu_precision=bf16 \
+    --run_data_pipeline=False \
+    --json_path=./fold_input_data.json \
+    --model_dir=$PATH_TO_AF3_MODEL \
+    --output_dir=./output_cpu_bf16
+```
+
+Compare with the FP32 command above using the same input, model parameters, seeds,
+sample count, and CPU/thread settings. Both modes use ordinary PyTorch operators
+and the same model code and padding strategy. FP32 mode explicitly disables CPU
+autocast, even when invoked inside an existing CPU autocast context.
+
+The noise schedule and initial diffusion positions retain their FP32 construction;
+this stage adds no explicit BF16 casts to model features, coordinates, or weights.
+Intermediate tensors follow autocast's operation-specific rules, including dtype
+promotion and in-place updates. BF16 result tensors are converted back to FP32
+before NumPy conversion and structure extraction. The startup log reports the
+selected CPU precision. CUDA retains its existing BF16 autocast; requesting
+`--cpu_precision=bf16` on a resolved CUDA device raises an error.
+
+Use this command to run both stages' static checks without importing model dependencies:
+
+```bash
+python -m unittest discover -s tests -p 'test_*static.py' -v
+```
+
+Static checks do not establish BF16 numerical accuracy, hardware acceleration, or
+speedup. Those require the target cluster and its PyTorch/AlphaFold3 environment.
 
 ## Acknowledgments
 
