@@ -13,8 +13,9 @@ dependencies = [
     "einops",
 ]
 
-[tool.setuptools]
-packages = ["xfold"]
+[tool.setuptools.packages.find]
+include = ["xfold", "xfold.*"]
+namespaces = true
 
 [tool.setuptools.dynamic]
 version = { attr = "xfold.version.VERSION" }

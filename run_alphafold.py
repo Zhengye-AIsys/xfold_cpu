@@ -22,6 +22,7 @@ https://github.com/google-deepmind/alphafold3/blob/main/WEIGHTS_TERMS_OF_USE.md
 
 import random
 from collections.abc import Sequence
+from contextlib import nullcontext
 import csv
 import dataclasses
 import multiprocessing
@@ -95,10 +96,19 @@ _RUN_INFERENCE = flags.DEFINE_bool(
     'Whether to run inference on the fold inputs.',
 )
 
+_DEVICE = flags.DEFINE_enum(
+    'device',
+    'auto',
+    ['auto', 'cpu', 'cuda'],
+    'Inference device. auto uses CUDA when available, otherwise CPU. '
+    'CPU inference uses FP32 and PyTorch operators.',
+)
+
 _USE_FASTNN = flags.DEFINE_bool(
     'fastnn',
     True,
-    'Whether to run inference with fastnn.',
+    'Whether to use Triton operators for CUDA inference. '
+    'CPU inference always uses PyTorch operators.',
 )
 
 # Binary paths.
@@ -211,19 +221,35 @@ class ModelRunner:
         device: torch.device,
     ):
         self._model_dir = model_dir
-        self._device = device
+        self._device = torch.device(device)
+        if self._device.type not in ('cpu', 'cuda'):
+            raise ValueError('Inference supports CPU and CUDA devices only.')
+        if self._device.type == 'cuda' and not torch.cuda.is_available():
+            raise RuntimeError(
+                'CUDA was requested but is unavailable. Use --device=cpu '
+                'or --device=auto.'
+            )
+
+        implementation = (
+            'triton' if self._device.type == 'cuda' and _USE_FASTNN.value
+            else 'torch'
+        )
+        fastnn_config.layer_norm_implementation = implementation
+        fastnn_config.dot_product_attention_implementation = implementation
+        fastnn_config.gated_linear_unit_implementation = implementation
 
         self._model = AlphaFold3(num_samples=_NUM_DIFFUSION_SAMPLES.value)
         self._model.eval()
         print('loading the model parameters...')
         import_jax_weights_(self._model, model_dir)
 
-        self._model = self._model.to(device=self._device)
+        self._model = self._model.to(
+            device=self._device, dtype=torch.float32)
 
-        if _USE_FASTNN.value is True:
-            fastnn_config.layer_norm_implementation = 'triton'
-            fastnn_config.dot_product_attention_implementation = 'triton'
-            fastnn_config.gated_linear_unit_implementation = 'triton'
+    def synchronize(self) -> None:
+        """Wait for inference work only when this runner uses CUDA."""
+        if self._device.type == 'cuda':
+            torch.cuda.synchronize(self._device)
 
     @torch.inference_mode()
     def run_inference(
@@ -236,15 +262,21 @@ class ModelRunner:
         )
         featurised_example = pytree.tree_map_only(
             torch.Tensor,
-            lambda x: x.to(device=self._device),
+            lambda x: x.to(device=self._device, dtype=torch.float32)
+            if self._device.type == 'cpu' and x.is_floating_point()
+            else x.to(device=self._device),
             featurised_example,
         )
         featurised_example['deletion_mean'] = featurised_example['deletion_mean'].to(
             dtype=torch.float32)
 
-        with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
+        inference_context = (
+            torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16)
+            if self._device.type == 'cuda' else nullcontext()
+        )
+        with inference_context:
             result = self._model(featurised_example)
-            result['__identifier__'] = self._model.__identifier__.numpy()
+            result['__identifier__'] = self._model.__identifier__.cpu().numpy()
 
         result = pytree.tree_map_only(
             torch.Tensor,
@@ -309,7 +341,7 @@ def predict_structure(
     all_inference_results = []
     for seed, example in zip(fold_input.rng_seeds, featurised_examples):
         print(f'Running model inference for seed {seed}...')
-        torch.cuda.synchronize()
+        model_runner.synchronize()
         inference_start_time = time.time()
 
         # set the random seed for the model.
@@ -318,7 +350,7 @@ def predict_structure(
         np.random.seed(seed)
 
         result = model_runner.run_inference(example)
-        torch.cuda.synchronize()
+        model_runner.synchronize()
         print(
             f'Running model inference for seed {seed} took '
             f' {time.time() - inference_start_time:.2f} seconds.'
@@ -581,7 +613,10 @@ def main(_):
         data_pipeline_config = None
 
     if _RUN_INFERENCE.value:
-        device = torch.device('cuda')
+        device_name = _DEVICE.value
+        if device_name == 'auto':
+            device_name = 'cuda' if torch.cuda.is_available() else 'cpu'
+        device = torch.device(device_name)
         print(f'Found local device: {device}')
 
         print('Building model from scratch...')

@@ -21,10 +21,10 @@ Follow the setup instructions provided in the [AlphaFold3 README](https://github
 
 ### Step 2: Install xfold
 
-Install xfold using pip:
+Install this checkout, including its CPU adaptation, using pip:
 
 ```bash
-pip install xfold
+python -m pip install -e .
 ```
 
 ### Step 3: Running Predictions
@@ -35,9 +35,44 @@ Execute protein structure predictions with the following command:
 python run_alphafold.py \
     --db_dir=$PATH_TO_AF3_DATASET \
     --json_path=./fold_input.json \
-    --model_dir=$$PATH_TO_AF3_MODEL \
+    --model_dir=$PATH_TO_AF3_MODEL \
     --output_dir=./output
 ```
+
+### CPU FP32 inference (stage 1)
+
+`--device=auto` (the default) selects CUDA when available, otherwise CPU.
+Use `--device=cpu` to select the CPU explicitly, including on a CUDA host.
+CPU inference uses FP32 model weights and floating-point features with ordinary
+PyTorch operators. It does not enable BF16, LIBXSMM, IPEX, or distributed inference.
+Integer indices and boolean masks retain their dtypes.
+
+For an input JSON that already includes MSA and template data:
+
+```bash
+python run_alphafold.py \
+    --device=cpu \
+    --run_data_pipeline=False \
+    --json_path=./fold_input_data.json \
+    --model_dir=$PATH_TO_AF3_MODEL \
+    --output_dir=./output_cpu_fp32
+```
+
+AlphaFold3 dependencies, chemical component data, and model parameters are still
+required. The current weight loader expects `af3.bin.zst`, `fourier_weight.npy`,
+and `fourier_bias.npy` inside `--model_dir`.
+Triton is loaded only when its CUDA operators are selected; it is not
+required by xfold's PyTorch CPU operator path. CUDA inference retains BF16 autocast
+and uses Triton when `--fastnn=True`; use `--fastnn=False` for PyTorch CUDA operators.
+
+The CPU adaptation can be checked without importing PyTorch, AlphaFold3, or Triton:
+
+```bash
+python -m unittest discover -s tests -p 'test_cpu_static.py' -v
+```
+
+These are source-level checks only. Numerical accuracy, complete CPU inference,
+and performance must be validated separately on the target environment.
 
 ## Acknowledgments
 
