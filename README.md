@@ -349,6 +349,51 @@ process-wide PyTorch operators. Numerical accuracy and speed are unvalidated on
 this Mac. Configuration examples, API sources, topology/runtime considerations,
 and the later cluster checklist are in [the stage 8 guide](docs/stage8_cpu.md).
 
+### Flexible CPU distributed inference (stage 9)
+
+`--distributed_mode=off|samples|tasks` keeps serial inference as the default.
+The two opt-ins support arbitrary positive rank counts, sample counts and
+diffusion step counts; there is no reference-style five-rank scheduling table.
+Ranks are worker processes, distinct from physical hosts and cores.
+
+| Mode | Unit of parallel work |
+| --- | --- |
+| `off` | Original serial inference |
+| `samples` | Complete diffusion trajectories for one input/seed; rank 0 computes trunk and output heads |
+| `tasks` | Complete inputs or input/seed pairs; configurable `auto|input|seed` granularity |
+
+Choose `--distributed_schedule=cyclic|block|weighted`; weighted accepts one
+nonnegative integer capacity per global rank. Remainders and idle ranks are
+supported. All results are written/ranked by rank 0 in the original seed/sample
+order. Each rank stores a complete model; this stage does not shard operator
+tensors or reduce per-rank model memory. More ranks than independent work can
+remain idle, so use task mode or more samples/seeds to expose more parallel work.
+
+Sample mode uses stable indexed CPU RNG streams, independent of rank placement.
+Compare it against `--distributed_mode=off --sample_rng=indexed`; default serial
+`--sample_rng=auto` retains the original RNG sequence. These two RNG schemes are
+different, and their outputs should not be treated as an exact-parity comparison.
+`--num_diffusion_samples` remains configurable; `--diffusion_steps` defaults to 200.
+
+The new `scripts/run_distributed.sh` supports torchrun, Open MPI, Intel MPI and
+externally managed ranks (including Slurm). Gloo is the default; oneCCL is an
+explicit optional `ccl` backend. The launcher reuses stage 8 CPU/NUMA configuration.
+Distributed modes require CPU inference and already completed MSA/template data.
+
+```bash
+# Command inspection only: 8 worker processes, 7 samples (one idle worker).
+XFOLD_DIST_PPN=8 XFOLD_DIST_MODE=samples XFOLD_CPU_THREADS=4 \
+  bash scripts/run_distributed.sh --dry-run \
+    --cpu_precision=bf16 --num_diffusion_samples=7 --diffusion_steps=200 \
+    --json_path=./fold_input_data.json \
+    --model_dir="$PATH_TO_AF3_MODEL" --output_dir=./stage9_samples
+```
+
+Remove `--dry-run` only on the cluster after validating the allocation/environment.
+Heterogeneous hostfile slots, rank weights, per-rank CPU binding, task mode,
+failure/timeout behavior and the static-only validation boundary are described in
+[the stage 9 guide](docs/stage9_distributed.md).
+
 ## Acknowledgments
 
 The xfold source code is licensed under the Apache License, Version 2.0.

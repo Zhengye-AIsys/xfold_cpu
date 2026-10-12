@@ -296,6 +296,17 @@ class AlphaFold3(nn.Module):
 
         self.distogram_head = DistogramHead()
         self.confidence_head = ConfidenceHead()
+        self._distributed_context = None
+        self._sample_rng = 'legacy'
+
+    def configure_sampling(self, sample_rng='auto', distributed_context=None):
+        if sample_rng not in ('auto', 'legacy', 'indexed'):
+            raise ValueError('Sample RNG must be auto, legacy, or indexed.')
+        parallel_samples = distributed_context is not None and distributed_context.mode == 'samples'
+        resolved = ('indexed' if parallel_samples else 'legacy') if sample_rng == 'auto' else sample_rng
+        if parallel_samples and resolved != 'indexed':
+            raise ValueError('Sample parallelism requires indexed RNG; compare serial with --sample_rng=indexed.')
+        self._sample_rng, self._distributed_context = resolved, distributed_context
 
     def create_target_feat_embedding(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
         target_feat = featurization.create_target_feat(
@@ -357,6 +368,9 @@ class AlphaFold3(nn.Module):
     ) -> dict[str, torch.Tensor]:
         """Sample using denoiser on batch."""
 
+        if self._sample_rng == 'indexed':
+            return self._sample_diffusion_indexed(batch, embeddings)
+
         mask = batch.predicted_structure_info.atom_mask
         num_samples = self.num_samples
 
@@ -380,10 +394,56 @@ class AlphaFold3(nn.Module):
 
         return {'atom_positions': positions, 'mask': final_dense_atom_mask}
 
-    def forward(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    def _sample_diffusion_indexed(self, batch, embeddings):
+        from xfold.distributed import sample_seed
+
+        mask = batch.predicted_structure_info.atom_mask
+        context = self._distributed_context
+        parallel = context is not None and context.mode == 'samples'
+        device = mask.device
+        base_seed = torch.initial_seed()
+        def allocate():
+            if device.type != 'cpu' or self.training or torch.is_grad_enabled():
+                raise ValueError('Indexed sampling requires CPU eval inference with disabled gradients.')
+            noise_levels = diffusion_head.noise_schedule(
+                torch.linspace(0, 1, self.diffusion_steps + 1, device=device))
+            positions = torch.empty((self.num_samples,) + mask.shape + (3,), device=device)
+            return noise_levels, positions
+        noise_levels, positions = (context.collective_call(allocate, 'diffusion allocation')
+                                   if parallel else allocate())
+        indices = context.indices(self.num_samples) if parallel else range(self.num_samples)
+
+        def compute_local():
+            for sample_idx in indices:
+                # CPU-only state isolation; do not reseed or initialize CUDA.
+                with torch.random.fork_rng(devices=[]):
+                    generator = torch.Generator(device='cpu').manual_seed(sample_seed(base_seed, sample_idx))
+                    torch.set_rng_state(generator.get_state())
+                    sample = torch.randn(mask.shape + (3,), device=device) * noise_levels[0]
+                    previous = noise_levels[0]
+                    for step_idx in range(self.diffusion_steps):
+                        sample, previous = self._apply_denoising_step(
+                            batch, embeddings, sample, previous, mask, noise_levels[1 + step_idx])
+                    positions[sample_idx] = sample
+
+        if parallel:
+            context.collective_call(compute_local, 'local diffusion samples')
+            for source in range(context.world_size):
+                for sample_idx in context.indices(self.num_samples, source):
+                    positions[sample_idx] = context.broadcast_tensor(positions[sample_idx], source)
+        else:
+            compute_local()
+        def result():
+            return {'atom_positions': positions,
+                    'mask': torch.tile(mask[None], (self.num_samples, 1, 1))}
+        return context.collective_call(result, 'sample masks') if parallel else result()
+
+    def forward(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor] | None:
         self.reset_input_cache()
         try:
             with input_cache_scope():
+                if self._distributed_context is not None and self._distributed_context.mode == 'samples':
+                    return self._forward_distributed(batch)
                 return self._forward_impl(batch)
         finally:
             self.reset_input_cache()
@@ -391,12 +451,10 @@ class AlphaFold3(nn.Module):
     def reset_input_cache(self):
         reset_input_cache(self)
 
-    def _forward_impl(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        batch = feat_batch.Batch.from_data_dict(batch)
+    def _compute_embeddings(self, batch):
+        # Shared by serial inference and the sample coordinator's rank 0.
         num_res = batch.num_res
-
         target_feat = self.create_target_feat_embedding(batch)
-
         embeddings = {
             'pair': torch.zeros(
                 [num_res, num_res, self.evoformer_pair_channel], device=target_feat.device,
@@ -405,21 +463,13 @@ class AlphaFold3(nn.Module):
             'single': torch.zeros(
                 [num_res, self.evoformer_seq_channel], dtype=torch.float32, device=target_feat.device,
             ),
-            'target_feat': target_feat,  # type: ignore
+            'target_feat': target_feat,
         }
-
         for _ in range(self.num_recycles):
-            embeddings = self.evoformer(
-                batch=batch,
-                prev=embeddings,
-                target_feat=target_feat
-            )
+            embeddings = self.evoformer(batch=batch, prev=embeddings, target_feat=target_feat)
+        return embeddings
 
-        # Recycle-only data no longer needs the example's shared cache budget.
-        self.reset_input_cache()
-        samples = self._sample_diffusion(batch, embeddings)
-        self.reset_input_cache()
-
+    def _compute_heads(self, batch, embeddings, samples):
         confidence_output_per_sample = []
         for sample_dense_atom_position in samples['atom_positions']:
             confidence_output_per_sample.append(self.confidence_head(
@@ -429,16 +479,38 @@ class AlphaFold3(nn.Module):
                 token_atoms_to_pseudo_beta=batch.pseudo_beta_info.token_atoms_to_pseudo_beta,
                 asym_id=batch.token_features.asym_id
             ))
-
         confidence_output = {}
         for key in confidence_output_per_sample[0]:
             confidence_output[key] = torch.stack(
                 [sample[key] for sample in confidence_output_per_sample], dim=0)
-
         distogram = self.distogram_head(batch, embeddings)
+        return {'diffusion_samples': samples, 'distogram': distogram, **confidence_output}
 
-        return {
-            'diffusion_samples': samples,
-            'distogram': distogram,
-            **confidence_output,
-        }
+    def _forward_distributed(self, batch):
+        context = self._distributed_context
+
+        def validate():
+            if self.training or torch.is_grad_enabled():
+                raise RuntimeError('Distributed sampling requires eval mode and disabled gradients.')
+            return feat_batch.Batch.from_data_dict(batch)
+        batch = context.collective_call(validate, 'sampling inputs')
+        embeddings = context.collective_call(
+            lambda: self._compute_embeddings(batch) if context.rank == 0 else None, 'rank 0 trunk')
+        embeddings = context.broadcast_tensor_dict(embeddings)
+        self.reset_input_cache()
+        samples = self._sample_diffusion(batch, embeddings)
+        self.reset_input_cache()
+        return context.collective_call(
+            lambda: self._compute_heads(batch, embeddings, samples) if context.rank == 0 else None,
+            'rank 0 confidence and distogram')
+
+    def _forward_impl(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        batch = feat_batch.Batch.from_data_dict(batch)
+        embeddings = self._compute_embeddings(batch)
+
+        # Recycle-only data no longer needs the example's shared cache budget.
+        self.reset_input_cache()
+        samples = self._sample_diffusion(batch, embeddings)
+        self.reset_input_cache()
+
+        return self._compute_heads(batch, embeddings, samples)

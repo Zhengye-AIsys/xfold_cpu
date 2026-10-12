@@ -169,6 +169,47 @@ _INPUT_CACHE_MAX_MB = flags.DEFINE_integer(
     'oversized values are recomputed. Packed weight caches use separate storage.',
 )
 
+_DISTRIBUTED_MODE = flags.DEFINE_enum(
+    'distributed_mode', 'off', ['off', 'samples', 'tasks'],
+    'off preserves serial inference; samples parallelizes independent diffusion '
+    'samples; tasks distributes inputs/seeds. Distributed modes require CPU '
+    'inference with a completed input data pipeline.',
+)
+_DISTRIBUTED_BACKEND = flags.DEFINE_enum(
+    'distributed_backend', 'gloo', ['gloo', 'ccl'],
+    'CPU communication backend. ccl explicitly loads optional oneCCL bindings.',
+)
+_DISTRIBUTED_SCHEDULE = flags.DEFINE_enum(
+    'distributed_schedule', 'cyclic', ['cyclic', 'block', 'weighted'],
+    'Work assignment independent of physical nodes; no fixed rank/sample limit.',
+)
+_DISTRIBUTED_RANK_WEIGHTS = flags.DEFINE_string(
+    'distributed_rank_weights', '',
+    'Weighted schedule: one nonnegative integer per rank, with a positive total. '
+    'Zero assigns no work to that rank; capacities refer to actual global ranks.',
+)
+_DISTRIBUTED_TASK_GRANULARITY = flags.DEFINE_enum(
+    'distributed_task_granularity', 'auto', ['auto', 'input', 'seed'],
+    'Task mode: auto distributes inputs when there are multiple inputs, otherwise '
+    'seeds. input handles all seeds of one input; seed schedules input/seed pairs.',
+)
+_DISTRIBUTED_TIMEOUT = flags.DEFINE_integer(
+    'distributed_timeout_seconds', 3600,
+    'Process-group collective timeout; size this for the longest computation phase.',
+)
+_DISTRIBUTED_MAX_PAYLOAD = flags.DEFINE_integer(
+    'distributed_max_payload_mb', 4096,
+    'Maximum serialized object payload in MiB; tensor broadcasts use separate storage.',
+)
+_SAMPLE_RNG = flags.DEFINE_enum(
+    'sample_rng', 'auto', ['auto', 'legacy', 'indexed'],
+    'auto retains serial RNG except sample parallelism, which requires indexed '
+    'CPU streams. Use indexed in serial mode for the matching parallel baseline.',
+)
+_DIFFUSION_STEPS = flags.DEFINE_integer(
+    'diffusion_steps', 200, 'Positive diffusion step count; default preserves the original schedule.',
+)
+
 # Binary paths.
 _JACKHMMER_BINARY_PATH = flags.DEFINE_string(
     'jackhmmer_binary_path',
@@ -286,9 +327,25 @@ class ModelRunner:
         layer_norm_backend: str = 'auto',
         cpu_threads: int | None = None,
         cpu_interop_threads: int | None = None,
+        distributed_context=None,
+        sample_rng: str = 'auto',
+        diffusion_steps: int = 200,
     ):
         self._model_dir = model_dir
         self._device = torch.device(device)
+        self._distributed_context = distributed_context
+        if distributed_context is not None and self._device.type != 'cpu':
+            raise ValueError('Distributed inference requires --device=cpu.')
+        if sample_rng not in ('auto', 'legacy', 'indexed'):
+            raise ValueError('Sample RNG must be auto, legacy, or indexed.')
+        if distributed_context is not None and distributed_context.mode == 'samples' and sample_rng == 'legacy':
+            raise ValueError('Sample parallelism requires --sample_rng=indexed or auto.')
+        if sample_rng == 'indexed' and self._device.type != 'cpu':
+            raise ValueError('Indexed sampling requires --device=cpu.')
+        if type(diffusion_steps) is not int or diffusion_steps < 1:
+            raise ValueError('Diffusion steps must be a positive integer.')
+        if type(_NUM_DIFFUSION_SAMPLES.value) is not int or _NUM_DIFFUSION_SAMPLES.value < 1:
+            raise ValueError('Diffusion samples must be a positive integer.')
         if self._device.type not in ('cpu', 'cuda'):
             raise ValueError('Inference supports CPU and CUDA devices only.')
         if self._device.type == 'cuda' and not torch.cuda.is_available():
@@ -371,7 +428,8 @@ class ModelRunner:
         print(f'Triangle backend: {fastnn_config.triangle_multiplication_implementation}; '
               f'Attention backend: {fastnn_config.dot_product_attention_implementation}')
 
-        self._model = AlphaFold3(num_samples=_NUM_DIFFUSION_SAMPLES.value)
+        self._model = AlphaFold3(num_samples=_NUM_DIFFUSION_SAMPLES.value, diffusion_steps=diffusion_steps)
+        self._model.configure_sampling(sample_rng, distributed_context)
         self._model.eval()
         print('loading the model parameters...')
         import_jax_weights_(self._model, model_dir)
@@ -403,37 +461,52 @@ class ModelRunner:
     @torch.inference_mode()
     def run_inference(
         self, featurised_example: features.BatchDict
-    ) -> base_model.ModelResult:
+    ) -> base_model.ModelResult | None:
         """Computes a forward pass of the model on a featurised example."""
-        featurised_example = pytree.tree_map(
-            torch.from_numpy, utils.remove_invalidly_typed_feats(
-                featurised_example)
-        )
-        featurised_example = pytree.tree_map_only(
-            torch.Tensor,
-            lambda x: x.to(device=self._device, dtype=torch.float32)
-            if self._device.type == 'cpu' and x.is_floating_point()
-            else x.to(device=self._device),
-            featurised_example,
-        )
-        featurised_example['deletion_mean'] = featurised_example['deletion_mean'].to(
-            dtype=torch.float32)
+        def prepare_features(featurised_example=featurised_example):
+            featurised_example = pytree.tree_map(
+                torch.from_numpy, utils.remove_invalidly_typed_feats(
+                    featurised_example)
+            )
+            featurised_example = pytree.tree_map_only(
+                torch.Tensor,
+                lambda x: x.to(device=self._device, dtype=torch.float32)
+                if self._device.type == 'cpu' and x.is_floating_point()
+                else x.to(device=self._device),
+                featurised_example,
+            )
+            featurised_example['deletion_mean'] = featurised_example['deletion_mean'].to(
+                dtype=torch.float32)
+            return featurised_example
+        context = self._distributed_context
+        parallel = context is not None and context.mode == 'samples'
+        featurised_example = (context.collective_call(prepare_features, 'feature conversion')
+                              if parallel else prepare_features())
 
         with self._inference_context():
             result = self._model(featurised_example)
-            result['__identifier__'] = self._model.__identifier__.cpu().numpy()
+            def identify():
+                if result is not None:
+                    result['__identifier__'] = self._model.__identifier__.cpu().numpy()
+            if parallel:
+                context.collective_call(identify, 'model identifier')
+            else:
+                identify()
 
-        result = pytree.tree_map_only(
-            torch.Tensor,
-            lambda x: x.to(
-                dtype=torch.float32) if x.dtype == torch.bfloat16 else x,
-            result,
-        )
-        result = pytree.tree_map_only(
-            torch.Tensor, lambda x: x.cpu().detach().numpy(), result)
-        result['__identifier__'] = result['__identifier__'].tobytes()
-
-        return result
+        def convert(result=result):
+            if result is None:
+                return None
+            result = pytree.tree_map_only(
+                torch.Tensor,
+                lambda x: x.to(
+                    dtype=torch.float32) if x.dtype == torch.bfloat16 else x,
+                result,
+            )
+            result = pytree.tree_map_only(
+                torch.Tensor, lambda x: x.cpu().detach().numpy(), result)
+            result['__identifier__'] = result['__identifier__'].tobytes()
+            return result
+        return context.collective_call(convert, 'result conversion') if parallel else convert()
 
     def extract_structures(
         self,
@@ -469,15 +542,22 @@ def predict_structure(
     fold_input: folding_input.Input,
     model_runner: ModelRunner,
     buckets: Sequence[int] | None = None,
+    distributed_context=None,
 ) -> Sequence[ResultsForSeed]:
     """Runs the full inference pipeline to predict structures for each seed."""
 
     print(f'Featurising data for seeds {fold_input.rng_seeds}...')
     featurisation_start_time = time.time()
-    ccd = chemical_components.cached_ccd(user_ccd=fold_input.user_ccd)
-    featurised_examples = featurisation.featurise_input(
-        fold_input=fold_input, buckets=buckets, ccd=ccd, verbose=True
-    )
+    def featurise():
+        ccd = chemical_components.cached_ccd(user_ccd=fold_input.user_ccd)
+        return featurisation.featurise_input(
+            fold_input=fold_input, buckets=buckets, ccd=ccd, verbose=True)
+    if distributed_context is None:
+        featurised_examples = featurise()
+    else:
+        featurised_examples = distributed_context.collective_call(
+            lambda: list(featurise()) if distributed_context.rank == 0 else None, 'rank 0 featurisation')
+        featurised_examples = distributed_context.broadcast_object(featurised_examples)
     print(
         f'Featurising data for seeds {fold_input.rng_seeds} took '
         f' {time.time() - featurisation_start_time:.2f} seconds.'
@@ -503,9 +583,13 @@ def predict_structure(
         print(
             f'Extracting output structures (one per sample) for seed {seed}...')
         extract_structures = time.time()
-        inference_results = model_runner.extract_structures(
-            batch=example, result=result, target_name=fold_input.name
-        )
+        def extract():
+            if result is None:
+                raise RuntimeError('The output rank did not receive a model result.')
+            return model_runner.extract_structures(batch=example, result=result, target_name=fold_input.name)
+        inference_results = (extract() if distributed_context is None else
+                             distributed_context.collective_call(
+                                 lambda: extract() if distributed_context.rank == 0 else [], 'structure extraction'))
         print(
             f'Extracting output structures (one per sample) for seed {seed} took '
             f' {time.time() - extract_structures:.2f} seconds.'
@@ -595,6 +679,7 @@ def process_fold_input(
     model_runner: None,
     output_dir: os.PathLike[str] | str,
     buckets: Sequence[int] | None = None,
+    distributed_context=None,
 ) -> folding_input.Input:
     ...
 
@@ -606,6 +691,7 @@ def process_fold_input(
     model_runner: ModelRunner,
     output_dir: os.PathLike[str] | str,
     buckets: Sequence[int] | None = None,
+    distributed_context=None,
 ) -> Sequence[ResultsForSeed]:
     ...
 
@@ -616,6 +702,7 @@ def process_fold_input(
     model_runner: ModelRunner | None,
     output_dir: os.PathLike[str] | str,
     buckets: Sequence[int] | None = None,
+    distributed_context=None,
 ) -> folding_input.Input | Sequence[ResultsForSeed]:
     """Runs data pipeline and/or inference on a single fold input.
 
@@ -651,7 +738,12 @@ def process_fold_input(
 
     print(f'Output directory: {output_dir}')
     print(f'Writing model input JSON to {output_dir}')
-    write_fold_input_json(fold_input, output_dir)
+    if distributed_context is None:
+        write_fold_input_json(fold_input, output_dir)
+    else:
+        distributed_context.collective_call(
+            lambda: write_fold_input_json(fold_input, output_dir) if distributed_context.rank == 0 else None,
+            'input JSON output')
     if model_runner is None:
         print('Skipping inference...')
         output = fold_input
@@ -664,23 +756,182 @@ def process_fold_input(
             fold_input=fold_input,
             model_runner=model_runner,
             buckets=buckets,
+            distributed_context=distributed_context,
         )
         print(
             f'Writing outputs for {fold_input.name} for seed(s)'
             f' {fold_input.rng_seeds}...'
         )
-        write_outputs(
-            all_inference_results=all_inference_results,
-            output_dir=output_dir,
-            job_name=fold_input.sanitised_name(),
-        )
+        def write():
+            write_outputs(all_inference_results=all_inference_results, output_dir=output_dir,
+                          job_name=fold_input.sanitised_name())
+        if distributed_context is None:
+            write()
+        else:
+            distributed_context.collective_call(
+                lambda: write() if distributed_context.rank == 0 else None, 'prediction output')
         output = all_inference_results
 
     print(f'Done processing fold input {fold_input.name}.')
     return output
 
 
+def _distributed_tasks(fold_inputs, model_runner, context):
+    granularity = _DISTRIBUTED_TASK_GRANULARITY.value
+    if granularity == 'auto':
+        granularity = 'input' if len(fold_inputs) > 1 else 'seed'
+    jobs = ([(input_idx, None) for input_idx in range(len(fold_inputs))] if granularity == 'input' else
+            [(input_idx, seed_idx) for input_idx, fold_input in enumerate(fold_inputs)
+             for seed_idx in range(len(fold_input.rng_seeds))])
+    assignments = [context.indices(len(jobs), rank) for rank in range(context.world_size)]
+    waves = max(len(indices) for indices in assignments)
+    local_jobs = assignments[context.rank]
+    print(f'Task plan: granularity={granularity}, jobs={len(jobs)}, '
+          f'local_jobs={len(local_jobs)}, waves={waves}')
+    pending, completed = {}, set()
+
+    def compute(job_id):
+        if job_id is None:
+            return None
+        input_idx, seed_idx = jobs[job_id]
+        original = fold_inputs[input_idx]
+        selected = original if seed_idx is None else dataclasses.replace(
+            original, rng_seeds=(original.rng_seeds[seed_idx],))
+        results = predict_structure(selected, model_runner)
+        # Root already has the full input; transport structures only, preserving
+        # original input/seed/sample order when writing global rankings.
+        return job_id, [(item.seed, list(item.inference_results)) for item in results]
+
+    def receive_and_write(received):
+        for item in received:
+            if item is None:
+                continue
+            job_id, results = item
+            input_idx, seed_idx = jobs[job_id]
+            original = fold_inputs[input_idx]
+            expected = range(len(original.rng_seeds)) if seed_idx is None else (seed_idx,)
+            if len(results) != len(expected):
+                raise RuntimeError('Task returned an incorrect seed count.')
+            accumulated = pending.setdefault(input_idx, {})
+            for ordinal, (seed, inference_results) in zip(expected, results):
+                if seed != original.rng_seeds[ordinal] or ordinal in accumulated or input_idx in completed:
+                    raise RuntimeError('Task returned a duplicate or mismatched seed.')
+                accumulated[ordinal] = ResultsForSeed(
+                    seed=seed, inference_results=inference_results, full_fold_input=original)
+            if len(accumulated) == len(original.rng_seeds):
+                output_dir = os.path.join(_OUTPUT_DIR.value, original.sanitised_name())
+                write_fold_input_json(original, output_dir)
+                write_outputs([accumulated[i] for i in range(len(original.rng_seeds))],
+                              output_dir, original.sanitised_name())
+                del pending[input_idx]
+                completed.add(input_idx)
+
+    for wave in range(waves):
+        job_id = local_jobs[wave] if wave < len(local_jobs) else None
+        result = context.collective_call(lambda: compute(job_id), f'task wave {wave}')
+        received = context.gather_objects_to_root(result)
+        context.collective_call(
+            lambda: receive_and_write(received) if context.rank == 0 else None, 'task output and ranking')
+
+    def finish():
+        if pending or len(completed) != len(fold_inputs):
+            raise RuntimeError('Distributed tasks did not produce every input/seed result.')
+    context.collective_call(lambda: finish() if context.rank == 0 else None, 'task completion')
+
+
+def _print_model_notice():
+    notice = textwrap.wrap(
+        'Running AlphaFold 3. Please note that standard AlphaFold 3 model'
+        ' parameters are only available under terms of use provided at'
+        ' https://github.com/google-deepmind/alphafold3/blob/main/WEIGHTS_TERMS_OF_USE.md.'
+        ' If you do not agree to these terms and are using AlphaFold 3 derived'
+        ' model parameters, cancel execution of AlphaFold 3 inference with'
+        ' CTRL-C, and do not use the model parameters.',
+        break_long_words=False,
+        break_on_hyphens=False,
+        width=80,
+    )
+    print('\n'.join(notice))
+
+
+def _main_distributed(context):
+    def validate():
+        if (_JSON_PATH.value is None) == (_INPUT_DIR.value is None):
+            raise ValueError('Exactly one of --json_path or --input_dir must be specified.')
+        if _RUN_DATA_PIPELINE.value or not _RUN_INFERENCE.value:
+            raise ValueError('Distributed inference requires --run_data_pipeline=False and --run_inference=True.')
+        if _DEVICE.value not in ('auto', 'cpu'):
+            raise ValueError('Distributed inference requires a CPU device.')
+    context.collective_call(validate, 'distributed flags')
+
+    # Rank-dependent thread/affinity settings may differ; model semantics and
+    # collective ownership settings must agree before loading models or data.
+    settings = (
+        context.mode, context.schedule, context.weights, context.max_payload_bytes,
+        _CPU_PRECISION.value, _GLU_BACKEND.value, _TRIANGLE_BACKEND.value,
+        _ATTENTION_BACKEND.value, _LAYER_NORM_BACKEND.value, _CACHE_MODE.value,
+        _INPUT_CACHE_MAX_MB.value, _NUM_DIFFUSION_SAMPLES.value, _DIFFUSION_STEPS.value,
+        _SAMPLE_RNG.value, _DISTRIBUTED_TASK_GRANULARITY.value, _MODEL_DIR.value,
+        _OUTPUT_DIR.value, _JSON_PATH.value, _INPUT_DIR.value,
+    )
+    root_settings = context.broadcast_object(settings if context.rank == 0 else None)
+    def check_settings():
+        if settings != root_settings:
+            raise ValueError('Ranks must use matching input/model/operator/sampling/collective settings.')
+    context.collective_call(check_settings, 'configuration agreement')
+
+    def load_inputs():
+        loaded = (folding_input.load_fold_inputs_from_dir(pathlib.Path(_INPUT_DIR.value))
+                  if _INPUT_DIR.value is not None else
+                  folding_input.load_fold_inputs_from_path(pathlib.Path(_JSON_PATH.value)))
+        inputs = list(loaded)
+        if not inputs:
+            raise ValueError('No fold inputs were found.')
+        names = [item.sanitised_name() for item in inputs]
+        if len(set(names)) != len(names):
+            raise ValueError('Distributed inputs must have distinct sanitized output names.')
+        for item in inputs:
+            if not item.chains or not item.rng_seeds or len(set(item.rng_seeds)) != len(item.rng_seeds):
+                raise ValueError('Each distributed input needs chains and unique nonempty seeds.')
+        os.makedirs(_OUTPUT_DIR.value, exist_ok=True)
+        return inputs
+    fold_inputs = context.collective_call(
+        lambda: load_inputs() if context.rank == 0 else None, 'input loading')
+    fold_inputs = context.broadcast_object(fold_inputs)
+    context.collective_call(lambda: _print_model_notice() if context.rank == 0 else None, 'model notice')
+
+    def construct():
+        return ModelRunner(
+            model_dir=pathlib.Path(_MODEL_DIR.value), device=torch.device('cpu'),
+            cpu_precision=_CPU_PRECISION.value, glu_backend=_GLU_BACKEND.value,
+            triangle_backend=_TRIANGLE_BACKEND.value, attention_backend=_ATTENTION_BACKEND.value,
+            cache_mode=_CACHE_MODE.value, input_cache_max_mb=_INPUT_CACHE_MAX_MB.value,
+            layer_norm_backend=_LAYER_NORM_BACKEND.value, cpu_threads=_CPU_THREADS.value,
+            cpu_interop_threads=_CPU_INTEROP_THREADS.value, distributed_context=context,
+            sample_rng=_SAMPLE_RNG.value, diffusion_steps=_DIFFUSION_STEPS.value,
+        )
+    model_runner = context.collective_call(construct, 'model construction and weight loading')
+    if context.mode == 'tasks':
+        _distributed_tasks(fold_inputs, model_runner, context)
+    else:
+        for fold_input in fold_inputs:
+            process_fold_input(
+                fold_input=fold_input, data_pipeline_config=None, model_runner=model_runner,
+                output_dir=os.path.join(_OUTPUT_DIR.value, fold_input.sanitised_name()),
+                distributed_context=context,
+            )
+    print(f'Rank {context.rank}: completed {len(fold_inputs)} inputs.')
+
+
 def main(_):
+    if _DISTRIBUTED_MODE.value != 'off':
+        from xfold.distributed import distributed_scope
+        with distributed_scope(
+            mode=_DISTRIBUTED_MODE.value, backend=_DISTRIBUTED_BACKEND.value,
+            timeout_seconds=_DISTRIBUTED_TIMEOUT.value, schedule=_DISTRIBUTED_SCHEDULE.value,
+            rank_weights=_DISTRIBUTED_RANK_WEIGHTS.value, max_payload_mb=_DISTRIBUTED_MAX_PAYLOAD.value,
+        ) as context:
+            return _main_distributed(context)
     if _JSON_PATH.value is None == _INPUT_DIR.value is None:
         raise ValueError(
             'Exactly one of --json_path or --input_dir must be specified.'
@@ -712,18 +963,7 @@ def main(_):
         print(f'Failed to create output directory {_OUTPUT_DIR.value}: {e}')
         raise
 
-    notice = textwrap.wrap(
-        'Running AlphaFold 3. Please note that standard AlphaFold 3 model'
-        ' parameters are only available under terms of use provided at'
-        ' https://github.com/google-deepmind/alphafold3/blob/main/WEIGHTS_TERMS_OF_USE.md.'
-        ' If you do not agree to these terms and are using AlphaFold 3 derived'
-        ' model parameters, cancel execution of AlphaFold 3 inference with'
-        ' CTRL-C, and do not use the model parameters.',
-        break_long_words=False,
-        break_on_hyphens=False,
-        width=80,
-    )
-    print('\n'.join(notice))
+    _print_model_notice()
 
     if _RUN_DATA_PIPELINE.value:
         def replace_db_dir(x): return string.Template(x).substitute(
@@ -777,6 +1017,8 @@ def main(_):
             layer_norm_backend=_LAYER_NORM_BACKEND.value,
             cpu_threads=_CPU_THREADS.value,
             cpu_interop_threads=_CPU_INTEROP_THREADS.value,
+            sample_rng=_SAMPLE_RNG.value,
+            diffusion_steps=_DIFFUSION_STEPS.value,
         )
     else:
         print('Skipping running model inference.')

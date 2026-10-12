@@ -1,0 +1,27 @@
+# Source explicitly with XFOLD_DIST_ENV_FILE=/absolute/path/to/your/file.
+# Counts are illustrations. Use your scheduler allocation and shared paths.
+XFOLD_DIST_LAUNCHER=torchrun  # torchrun | openmpi | intelmpi | external
+XFOLD_DIST_MODE=samples      # samples | tasks
+XFOLD_DIST_BACKEND=gloo      # gloo | ccl (optional compatible CPU bindings)
+XFOLD_DIST_SCHEDULE=cyclic   # cyclic | block | weighted
+XFOLD_DIST_RANK_WEIGHTS=
+XFOLD_DIST_TASK_GRANULARITY=auto  # auto | input | seed
+XFOLD_DIST_TIMEOUT_SECONDS=3600
+XFOLD_DIST_MAX_PAYLOAD_MB=4096
+
+# Homogeneous torchrun: start one launcher per host with a distinct node rank.
+XFOLD_DIST_NNODES=1
+XFOLD_DIST_PPN=1
+XFOLD_DIST_NODE_RANK=0
+MASTER_ADDR=127.0.0.1
+MASTER_PORT=29500
+
+# MPI: an explicit total can differ from NNODES * PPN. For heterogeneous slots,
+# unset XFOLD_DIST_PPN and use the MPI implementation's own hostfile syntax.
+XFOLD_DIST_WORLD_SIZE=
+XFOLD_DIST_HOSTFILE=
+XFOLD_DIST_MPI_BINDING=none  # none | inherit
+XFOLD_DIST_MPIRUN=mpirun
+
+# Workers source this separately, after MPI/torchrun exposes their local rank.
+XFOLD_CPU_ENV_FILE=
