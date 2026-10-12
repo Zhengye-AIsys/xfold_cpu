@@ -21,6 +21,7 @@ from collections.abc import Iterator
 import contextlib
 import io
 import os
+import operator
 import pathlib
 import re
 import struct
@@ -100,11 +101,18 @@ class _MultiFileIO(io.RawIOBase):
     """A file-like object that presents a concatenated view of multiple files."""
 
     def __init__(self, files: list[pathlib.Path]):
+        super().__init__()
+        if not files:
+            raise ValueError('At least one checkpoint file is required.')
         self._files = files
         self._stack = contextlib.ExitStack()
-        self._handles = [
-            self._stack.enter_context(file.open('rb')) for file in files
-        ]
+        try:
+            self._handles = [
+                self._stack.enter_context(file.open('rb')) for file in files
+            ]
+        except BaseException:
+            self._stack.close()
+            raise
         self._sizes = []
         for handle in self._handles:
             handle.seek(0, os.SEEK_END)
@@ -114,46 +122,63 @@ class _MultiFileIO(io.RawIOBase):
         for s in self._sizes[:-1]:
             self._offsets.append(self._offsets[-1] + s)
         self._abspos = 0
-        self._relpos = (0, 0)
+        self._relpos = self._abs_to_rel(0)
 
     def _abs_to_rel(self, pos: int) -> tuple[int, int]:
         idx = bisect.bisect_right(self._offsets, pos) - 1
         return idx, pos - self._offsets[idx]
 
     def close(self):
-        self._stack.close()
-
-    def closed(self) -> bool:
-        return all(handle.closed for handle in self._handles)
+        try:
+            if hasattr(self, '_stack'):
+                self._stack.close()
+        finally:
+            super().close()
 
     def fileno(self) -> int:
         return -1
 
     def readable(self) -> bool:
+        self._checkClosed()
+        return True
+
+    def seekable(self) -> bool:
+        self._checkClosed()
         return True
 
     def tell(self) -> int:
+        self._checkClosed()
         return self._abspos
 
     def seek(self, pos: int, whence: int = os.SEEK_SET, /):
+        self._checkClosed()
+        pos, whence = operator.index(pos), operator.index(whence)
         match whence:
             case os.SEEK_SET:
                 pass
             case os.SEEK_CUR:
                 pos += self._abspos
             case os.SEEK_END:
-                pos = self._length - pos
+                pos += self._length
             case _:
                 raise ValueError(f'Invalid whence: {whence}')
+        if pos < 0:
+            raise ValueError('Negative checkpoint seek position.')
         self._abspos = pos
         self._relpos = self._abs_to_rel(pos)
+        return self._abspos
 
     def readinto(self, b: bytearray | memoryview) -> int:
+        self._checkClosed()
+        if self._abspos >= self._length:
+            return 0
         result = 0
-        mem = memoryview(b)
+        mem = memoryview(b).cast('B')
         while mem:
             self._handles[self._relpos[0]].seek(self._relpos[1])
             count = self._handles[self._relpos[0]].readinto(mem)
+            if count == 0:
+                raise OSError('Checkpoint file changed or ended before its recorded size.')
             result += count
             self._abspos += count
             self._relpos = self._abs_to_rel(self._abspos)
@@ -167,7 +192,8 @@ class _MultiFileIO(io.RawIOBase):
 def open_for_reading(model_files: list[pathlib.Path], is_compressed: bool):
     with contextlib.closing(_MultiFileIO(model_files)) as f:
         if is_compressed:
-            yield zstandard.ZstdDecompressor().stream_reader(f)
+            with zstandard.ZstdDecompressor().stream_reader(f) as reader:
+                yield reader
         else:
             yield f
 
@@ -181,7 +207,8 @@ def _match_model(
         match = pattern.fullmatch(path.name)
         if match:
             models[match.group('model_name')].append(path)
-    return {k: sorted(v) for k, v in models.items()}
+    return {k: sorted(v, key=lambda path: int(pattern.fullmatch(path.name).groupdict().get('part') or 0))
+            for k, v in models.items()}
 
 
 def select_model_files(
@@ -191,10 +218,10 @@ def select_model_files(
     files = [file for file in model_dir.iterdir() if file.is_file()]
 
     for pattern, is_compressed in (
-        (r'(?P<model_name>.*)\.[0-9]+\.bin\.zst$', True),
-        (r'(?P<model_name>.*)\.bin\.zst\.[0-9]+$', True),
-        (r'(?P<model_name>.*)\.[0-9]+\.bin$', False),
-        (r'(?P<model_name>.*)\.bin]\.[0-9]+$', False),
+        (r'(?P<model_name>.*)\.(?P<part>[0-9]+)\.bin\.zst$', True),
+        (r'(?P<model_name>.*)\.bin\.zst\.(?P<part>[0-9]+)$', True),
+        (r'(?P<model_name>.*)\.(?P<part>[0-9]+)\.bin$', False),
+        (r'(?P<model_name>.*)\.bin\.(?P<part>[0-9]+)$', False),
         (r'(?P<model_name>.*)\.bin\.zst$', True),
         (r'(?P<model_name>.*)\.bin$', False),
     ):

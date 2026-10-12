@@ -20,6 +20,8 @@ if received directly from Google. Use is subject to terms of use available at
 https://github.com/google-deepmind/alphafold3/blob/main/WEIGHTS_TERMS_OF_USE.md
 """
 
+from __future__ import annotations
+
 import random
 from collections.abc import Sequence
 import csv
@@ -35,16 +37,6 @@ from typing import overload
 
 from absl import app
 from absl import flags
-from alphafold3.common import folding_input
-from alphafold3.constants import chemical_components
-import alphafold3.cpp
-from alphafold3.data import featurisation
-from alphafold3.data import pipeline
-from alphafold3.model import features
-from alphafold3.model import post_processing
-from alphafold3.model.components import base_model
-from alphafold3.model.components import utils
-from alphafold3.model.diffusion.model import Diffuser
 
 import numpy as np
 import torch
@@ -311,6 +303,33 @@ _NUM_DIFFUSION_SAMPLES = flags.DEFINE_integer(
 )
 
 
+_AF3_DEPENDENCIES_LOADED = False
+
+
+def _load_alphafold_dependencies():
+    """Keep --help and local CPU tests independent of the upstream AF3 install."""
+    global folding_input, chemical_components, alphafold3, featurisation, pipeline
+    global features, post_processing, base_model, utils, Diffuser
+    global _AF3_DEPENDENCIES_LOADED
+    if _AF3_DEPENDENCIES_LOADED:
+        return
+    try:
+        from alphafold3.common import folding_input
+        from alphafold3.constants import chemical_components
+        import alphafold3.cpp
+        from alphafold3.data import featurisation, pipeline
+        from alphafold3.model import features, post_processing
+        from alphafold3.model.components import base_model, utils
+        from alphafold3.model.diffusion.model import Diffuser
+    except (ImportError, OSError) as error:
+        raise RuntimeError(
+            'AlphaFold3 dependencies are unavailable or incompatible. Prepare the '
+            'upstream AlphaFold3 environment described in README.md before prediction. '
+            f'Original import error: {error}'
+        ) from error
+    _AF3_DEPENDENCIES_LOADED = True
+
+
 class ModelRunner:
     """Helper class to run structure prediction stages."""
 
@@ -428,6 +447,7 @@ class ModelRunner:
         print(f'Triangle backend: {fastnn_config.triangle_multiplication_implementation}; '
               f'Attention backend: {fastnn_config.dot_product_attention_implementation}')
 
+        _load_alphafold_dependencies()
         self._model = AlphaFold3(num_samples=_NUM_DIFFUSION_SAMPLES.value, diffusion_steps=diffusion_steps)
         self._model.configure_sampling(sample_rng, distributed_context)
         self._model.eval()
@@ -546,6 +566,7 @@ def predict_structure(
 ) -> Sequence[ResultsForSeed]:
     """Runs the full inference pipeline to predict structures for each seed."""
 
+    _load_alphafold_dependencies()
     print(f'Featurising data for seeds {fold_input.rng_seeds}...')
     featurisation_start_time = time.time()
     def featurise():
@@ -729,6 +750,8 @@ def process_fold_input(
     if not fold_input.chains:
         raise ValueError('Fold input has no chains.')
 
+    _load_alphafold_dependencies()
+
     if data_pipeline_config is None:
         print('Skipping data pipeline...')
     else:
@@ -863,6 +886,7 @@ def _main_distributed(context):
         if _DEVICE.value not in ('auto', 'cpu'):
             raise ValueError('Distributed inference requires a CPU device.')
     context.collective_call(validate, 'distributed flags')
+    context.collective_call(_load_alphafold_dependencies, 'AlphaFold3 dependencies')
 
     # Rank-dependent thread/affinity settings may differ; model semantics and
     # collective ownership settings must agree before loading models or data.
@@ -932,7 +956,7 @@ def main(_):
             rank_weights=_DISTRIBUTED_RANK_WEIGHTS.value, max_payload_mb=_DISTRIBUTED_MAX_PAYLOAD.value,
         ) as context:
             return _main_distributed(context)
-    if _JSON_PATH.value is None == _INPUT_DIR.value is None:
+    if (_JSON_PATH.value is None) == (_INPUT_DIR.value is None):
         raise ValueError(
             'Exactly one of --json_path or --input_dir must be specified.'
         )
@@ -942,6 +966,8 @@ def main(_):
             'At least one of --run_inference or --run_data_pipeline must be'
             ' set to true.'
         )
+
+    _load_alphafold_dependencies()
 
     if _INPUT_DIR.value is not None:
         fold_inputs = folding_input.load_fold_inputs_from_dir(

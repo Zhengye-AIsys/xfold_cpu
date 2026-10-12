@@ -8,9 +8,13 @@ authors = [{ name = "Shenggan Cheng", email = "shenggan.c@u.nus.edu" }]
 description = "fold for everyone."
 readme = { file = "README.md", content-type = "text/markdown" }
 dynamic = ["version"]
+requires-python = ">=3.11"
 dependencies = [
-    "torch", 
+    "torch>=2.6",
     "einops",
+    "numpy",
+    "zstandard",
+    "absl-py",
 ]
 
 [tool.setuptools.packages.find]

@@ -394,6 +394,33 @@ Heterogeneous hostfile slots, rank weights, per-rank CPU binding, task mode,
 failure/timeout behavior and the static-only validation boundary are described in
 [the stage 9 guide](docs/stage9_distributed.md).
 
+### Executable CPU checks without trained weights
+
+Python 3.11 and PyTorch 2.6 or newer are required. The package declares its direct CPU/runner
+dependencies; the upstream AlphaFold3 environment and model/data resources are
+still required for structure prediction. Runner help is available without an
+AlphaFold3 installation, and missing upstream dependencies fail before allocating
+the full model.
+
+In a separate test environment, run:
+
+```bash
+python run_alphafold.py --helpshort
+python -m unittest discover -s tests -p 'test_*static.py' -v
+OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+  python -m unittest discover -s tests -p 'test_*runtime.py' -v
+```
+
+Abseil short help normally exits with status 1 after printing help. Runtime checks
+execute real small CPU operators and local 3/6-process Gloo communication, so they
+need process/shared-memory/loopback access. They require no trained weights and do
+not launch MPI or install native libraries. Sample/task control-flow tests use
+small test heads/results, not complete AlphaFold3 predictions.
+
+Isolated checks passed on CPU PyTorch 2.6.0 and 2.14.1. Installation, validation
+coverage, fixes, compiler limitations and the remaining cluster checks are recorded
+in [the executable validation report](docs/executable_validation.md).
+
 ## Acknowledgments
 
 The xfold source code is licensed under the Apache License, Version 2.0.

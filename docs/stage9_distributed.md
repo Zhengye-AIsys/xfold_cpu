@@ -238,9 +238,13 @@ not simply hostname order. Inspect actual mapping before selecting capacities.
 
 ## Validation boundary and cluster checklist
 
-On this Mac only Python source compilation/AST contracts, shell parsing and
-whitespace/reference audits run. No planner runtime tests, process groups,
-MPI/CCL/IPEX loading, tensor inference, native builds or timings run here.
+The stage9 commit was initially checked only through Python source compilation/
+AST contracts, shell parsing and whitespace/reference audits. A later authorized
+isolated validation also ran small CPU operators, partition matrices and real
+local 3/6-process Gloo coordination on this Mac. See the
+[executable validation report](executable_validation.md) for precise coverage.
+The production distributed launcher still requires Linux. MPI/CCL/IPEX execution,
+native linking/AMX execution, full trained inference and timings remain unvalidated.
 
 ```bash
 python3 -m unittest discover -s tests -p 'test_*static.py' -v
