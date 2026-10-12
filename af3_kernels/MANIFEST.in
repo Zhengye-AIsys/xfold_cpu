@@ -1,0 +1,5 @@
+include README.md LICENSE libxsmm.lock.json build_support.py
+recursive-include src *.py *.cpp *.h *.txt
+recursive-include third_party/libxsmm *
+global-exclude *.pyc *.so *.o *.a
+prune build

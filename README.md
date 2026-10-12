@@ -118,6 +118,25 @@ python -m unittest discover -s tests -p 'test_*static.py' -v
 Static checks do not establish BF16 numerical accuracy, hardware acceleration, or
 speedup. Those require the target cluster and its PyTorch/AlphaFold3 environment.
 
+### Optional C++ / LIBXSMM infrastructure (stage 3)
+
+The separate [af3_kernels package](af3_kernels/README.md) adds native CPU tools,
+a pinned LIBXSMM source snapshot, and an explicit Linux x86_64 build path.
+It is not a dependency of the main xfold package. No model operator or inference
+configuration is changed; both FP32 and BF16 baselines still use PyTorch.
+
+On the target cluster, after preparing its CPU PyTorch environment:
+
+```bash
+MAX_JOBS=8 CC=gcc CXX=g++ \
+  python -m pip install -v --no-build-isolation --no-deps ./af3_kernels
+```
+
+Importing `af3_kernels` does not build or load native code. Native loading happens
+only when an explicit tool/probe is called. This stage has only been checked
+statically on the development Mac; native compilation and execution remain
+unverified. See the package README for build, tools, licenses, and validation steps.
+
 ## Acknowledgments
 
 The xfold source code is licensed under the Apache License, Version 2.0.
