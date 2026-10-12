@@ -19,6 +19,7 @@ import einops
 
 from xfold.nn import atom_layout
 from xfold import fastnn
+from xfold.fastnn.gated_linear_unit import GLUWeightCache
 
 
 class AdaptiveLayerNorm(nn.Module):
@@ -109,6 +110,7 @@ class DiffusionTransition(nn.Module):
             self.c_x, self.c_single_cond, self.use_single_cond)
         self.transition1 = nn.Linear(
             self.c_x, 2 * self.c_x * self.num_intermediate_factor, bias=False)
+        self._glu_weight_cache = GLUWeightCache()
 
         self.adaptive_zero_init = AdaLNZero(
             self.num_intermediate_factor * self.c_x,
@@ -119,7 +121,8 @@ class DiffusionTransition(nn.Module):
 
     def forward(self, x: torch.Tensor, single_cond: Optional[torch.Tensor] = None) -> torch.Tensor:
         x = self.adaptive_layernorm(x, single_cond)
-        c = fastnn.gated_linear_unit(x, self.transition1.weight.T)
+        c = fastnn.gated_linear_unit(
+            x, self.transition1.weight.T, weight_cache=self._glu_weight_cache)
         return self.adaptive_zero_init(c, single_cond)
 
 

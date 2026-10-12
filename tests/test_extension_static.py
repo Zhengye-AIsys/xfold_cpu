@@ -47,17 +47,19 @@ class ExtensionStaticTests(unittest.TestCase):
         self.assertEqual(modules, ['torch', 'af3_kernels._C'])
         self.assertTrue(any(isinstance(node, ast.Try) for node in loader.body))
 
-    def test_model_and_runner_never_import_the_optional_extension(self):
+    def test_model_and_runner_never_eagerly_import_the_optional_extension(self):
         paths = [ROOT / 'run_alphafold.py']
         paths.extend((ROOT / 'xfold').rglob('*.py'))
         for path in paths:
             with self.subTest(path=path.relative_to(ROOT)):
                 tree = ast.parse(path.read_text())
-                for node in ast.walk(tree):
-                    if isinstance(node, ast.Import):
-                        self.assertFalse(any(item.name.startswith('af3_kernels') for item in node.names))
-                    elif isinstance(node, ast.ImportFrom):
-                        self.assertFalse((node.module or '').startswith('af3_kernels'))
+                self.assertFalse(any(name.startswith('af3_kernels') for name in eager_imports(tree)))
+                if path != ROOT / 'xfold/fastnn/gated_linear_unit.py':
+                    for node in ast.walk(tree):
+                        if isinstance(node, ast.Import):
+                            self.assertFalse(any(item.name.startswith('af3_kernels') for item in node.names))
+                        elif isinstance(node, ast.ImportFrom):
+                            self.assertFalse((node.module or '').startswith('af3_kernels'))
 
     def test_main_distribution_does_not_require_native_package(self):
         config = tomllib.loads((ROOT / 'pyproject.toml').read_text())
@@ -129,6 +131,7 @@ class ExtensionStaticTests(unittest.TestCase):
         self.assertEqual(len(extension), 1)
         self.assertEqual(ast.literal_eval(extension[0].args[0]), 'af3_kernels._C')
         options = {item.arg: item.value for item in extension[0].keywords}
+        self.assertIn('src/csrc/gated_linear_unit.cpp', ast.literal_eval(options['sources']))
         for name in ast.literal_eval(options['sources']):
             self.assertFalse(Path(name).is_absolute())
             self.assertTrue((EXTENSION / name).is_file())
@@ -141,16 +144,15 @@ class ExtensionStaticTests(unittest.TestCase):
 
     def test_python_native_tools_match_bindings(self):
         names = set(re.findall(r'module\.def\("([a-z_]+)"', self.bindings))
-        self.assertEqual(names, {'runtime_info', 'pad_and_align_tensor', 'vnni_repack_tensor', 'gemm'})
+        self.assertEqual(names, {'runtime_info', 'pad_and_align_tensor', 'vnni_repack_tensor', 'gemm', 'gated_linear_unit'})
         for name in names:
             function = next(node for node in self.package.body if getattr(node, 'name', None) == name)
             self.assertEqual(len(calls(function, f'load_extension().{name}')), 1)
-        self.assertNotIn('gated_linear_unit', names)
         self.assertNotIn('triangle_multiplication', names)
         self.assertNotIn('attention', names)
 
     def test_native_libxsmm_api_names_exist_in_pinned_headers(self):
-        code = self.native + self.bindings
+        code = self.native + self.bindings + (EXTENSION / 'src/csrc/gated_linear_unit.cpp').read_text()
         header = (VENDOR / 'include/libxsmm.h').read_text()
         typedefs = (VENDOR / 'include/libxsmm_typedefs.h').read_text()
         apis = set(re.findall(r'\b(libxsmm_[a-z_]+)\s*\(', code))

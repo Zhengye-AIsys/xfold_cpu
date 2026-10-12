@@ -100,7 +100,7 @@ _DEVICE = flags.DEFINE_enum(
     'auto',
     ['auto', 'cpu', 'cuda'],
     'Inference device. auto uses CUDA when available, otherwise CPU. '
-    'CPU inference uses PyTorch operators and --cpu_precision.',
+    'CPU inference uses --cpu_precision and --glu_backend.',
 )
 
 _CPU_PRECISION = flags.DEFINE_enum(
@@ -116,7 +116,16 @@ _USE_FASTNN = flags.DEFINE_bool(
     'fastnn',
     True,
     'Whether to use Triton operators for CUDA inference. '
-    'CPU inference always uses PyTorch operators.',
+    'CPU GLU is selected separately with --glu_backend.',
+)
+
+_GLU_BACKEND = flags.DEFINE_enum(
+    'glu_backend',
+    'auto',
+    ['auto', 'torch', 'cpp'],
+    'GLU backend. auto preserves PyTorch CPU / fastnn CUDA behavior; '
+    'torch selects PyTorch GLU; cpp explicitly selects the optional CPU '
+    'C++/LIBXSMM extension. LayerNorm and Attention are selected separately.',
 )
 
 # Binary paths.
@@ -228,6 +237,7 @@ class ModelRunner:
         model_dir: pathlib.Path,
         device: torch.device,
         cpu_precision: str = 'fp32',
+        glu_backend: str = 'auto',
     ):
         self._model_dir = model_dir
         self._device = torch.device(device)
@@ -247,13 +257,23 @@ class ModelRunner:
             )
         self._cpu_precision = cpu_precision
 
+        if glu_backend not in ('auto', 'torch', 'cpp'):
+            raise ValueError('GLU backend must be auto, torch, or cpp.')
+        if glu_backend == 'cpp':
+            if self._device.type != 'cpu':
+                raise ValueError('--glu_backend=cpp requires --device=cpu.')
+            from xfold.fastnn.gated_linear_unit import load_cpp_glu
+            load_cpp_glu()
+
         implementation = (
             'triton' if self._device.type == 'cuda' and _USE_FASTNN.value
             else 'torch'
         )
         fastnn_config.layer_norm_implementation = implementation
         fastnn_config.dot_product_attention_implementation = implementation
-        fastnn_config.gated_linear_unit_implementation = implementation
+        fastnn_config.gated_linear_unit_implementation = (
+            implementation if glu_backend == 'auto' else glu_backend)
+        print(f'GLU backend: {fastnn_config.gated_linear_unit_implementation}')
 
         self._model = AlphaFold3(num_samples=_NUM_DIFFUSION_SAMPLES.value)
         self._model.eval()
@@ -653,6 +673,7 @@ def main(_):
             model_dir=pathlib.Path(_MODEL_DIR.value),
             device=device,
             cpu_precision=_CPU_PRECISION.value,
+            glu_backend=_GLU_BACKEND.value,
         )
     else:
         print('Skipping running model inference.')

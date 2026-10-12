@@ -54,7 +54,7 @@ class BuildLibxsmmExtension(BuildExtension):
 setup(
     ext_modules=[CppExtension(
         'af3_kernels._C',
-        sources=['src/csrc/bindings.cpp', 'src/csrc/tools.cpp'],
+        sources=['src/csrc/bindings.cpp', 'src/csrc/tools.cpp', 'src/csrc/gated_linear_unit.cpp'],
         extra_compile_args=['-O3', '-std=c++17', '-fopenmp', '-march=native'],
         extra_link_args=['-fopenmp', '-ldl', '-lm', '-lpthread'],
         define_macros=[('XFOLD_LIBXSMM_REVISION', f'"{LIBXSMM_REVISION}"')],

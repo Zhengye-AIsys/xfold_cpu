@@ -5,10 +5,10 @@ from importlib import import_module
 import platform
 
 
-__version__ = '0.1.0'
+__version__ = '0.2.0'
 __all__ = [
     'is_available', 'load_extension', 'runtime_info',
-    'pad_and_align_tensor', 'vnni_repack_tensor', 'gemm',
+    'pad_and_align_tensor', 'vnni_repack_tensor', 'gemm', 'gated_linear_unit',
 ]
 
 
@@ -54,3 +54,12 @@ def vnni_repack_tensor(x, type=2, BLK_SZ=0):
 def gemm(a, b):
     """Infrastructure probe: CPU 2D FP32/BF16 inputs, FP32 output; inference only."""
     return load_extension().gemm(a, b)
+
+
+def gated_linear_unit(x, weight, M_BLK=128, N_BLK=128):
+    """CPU inference GLU: [..., K] @ [K, 2*N], FP32/BF16 matching inputs.
+
+    Returns [..., N] in the input dtype. This raw API does not implement autocast;
+    the xfold bridge handles autocast, contiguous copies, and weight caching.
+    """
+    return load_extension().gated_linear_unit(x, weight, M_BLK, N_BLK)

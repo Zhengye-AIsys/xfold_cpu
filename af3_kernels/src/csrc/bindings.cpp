@@ -23,4 +23,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
     module.def("vnni_repack_tensor", &vnni_repack_tensor,
                py::arg("x"), py::arg("type") = 2, py::arg("BLK_SZ") = 0);
     module.def("gemm", &xsmm_gemm, py::arg("a"), py::arg("b"));
+    module.def("gated_linear_unit", &xsmm_gated_linear_unit,
+               py::arg("x"), py::arg("weight"),
+               py::arg("M_BLK") = 128, py::arg("N_BLK") = 128,
+               py::call_guard<py::gil_scoped_release>());
 }

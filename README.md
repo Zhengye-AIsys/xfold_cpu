@@ -123,7 +123,8 @@ speedup. Those require the target cluster and its PyTorch/AlphaFold3 environment
 The separate [af3_kernels package](af3_kernels/README.md) adds native CPU tools,
 a pinned LIBXSMM source snapshot, and an explicit Linux x86_64 build path.
 It is not a dependency of the main xfold package. No model operator or inference
-configuration is changed; both FP32 and BF16 baselines still use PyTorch.
+configuration was changed in stage 3. The default FP32 and BF16 baselines still
+use PyTorch; stage 4 adds an explicit GLU opt-in described below.
 
 On the target cluster, after preparing its CPU PyTorch environment:
 
@@ -136,6 +137,55 @@ Importing `af3_kernels` does not build or load native code. Native loading happe
 only when an explicit tool/probe is called. This stage has only been checked
 statically on the development Mac; native compilation and execution remain
 unverified. See the package README for build, tools, licenses, and validation steps.
+
+### C++ / LIBXSMM GLU in Transition (stage 4)
+
+`--glu_backend=cpp` selects the native GLU in both `Transition` and
+`DiffusionTransition`. Two LIBXSMM projections and tile-local C++ SiLU/multiply
+replace `matmul -> chunk -> silu -> multiply`. Normalization, the final projection,
+and diffusion conditioning continue using their existing PyTorch implementations.
+FP32 and BF16 are supported; this does not convert the whole Transition to native
+code or prove that AMX executes.
+
+The default `--glu_backend=auto` preserves previous behavior: PyTorch on CPU,
+Triton on CUDA with `--fastnn=True`. `--glu_backend=torch` explicitly selects the
+original PyTorch GLU. LayerNorm and Attention backend choices are independent.
+The C++ path is CPU inference-only and requires rebuilding the optional package
+on Linux x86_64. Missing packages, an older stage 3 binary, or unsupported native
+shapes raise errors; there is no silent fallback.
+
+On the target cluster, rebuild the optional package using the stage 3 command
+above, then compare these four settings with the same input and inference flags:
+
+| Comparison | Arguments |
+| --- | --- |
+| PyTorch FP32 baseline | `--device=cpu --cpu_precision=fp32 --glu_backend=torch` |
+| C++ FP32 GLU | `--device=cpu --cpu_precision=fp32 --glu_backend=cpp` |
+| PyTorch BF16 baseline | `--device=cpu --cpu_precision=bf16 --glu_backend=torch` |
+| C++ BF16 GLU | `--device=cpu --cpu_precision=bf16 --glu_backend=cpp` |
+
+For example, after rebuilding on the cluster:
+
+```bash
+python run_alphafold.py \
+    --device=cpu --cpu_precision=bf16 --glu_backend=cpp \
+    --run_data_pipeline=False \
+    --json_path=./fold_input_data.json \
+    --model_dir=$PATH_TO_AF3_MODEL \
+    --output_dir=./output_cpu_bf16_cpp_glu
+```
+
+Stored model weights remain FP32. The bridge reads CPU autocast state, prepares
+FP32/BF16 contiguous inputs, and caches one transposed/converted weight per
+Transition. The cache refreshes when the weight's mutation counter, storage,
+shape, stride, device, or dtype changes; tensors without a mutation counter are
+not cached. The cache is not part of `state_dict`. BF16 VNNI2 packing is still
+performed per native call; persistent packed-weight caching is future work.
+
+The development Mac runs only the source checks listed above. Target validation
+must cover native compilation, GLU/Transition numerical comparisons, edge shapes,
+cache invalidation, full inference, and timing with matched CPU/thread settings.
+See [native operator details and cluster validation](af3_kernels/README.md).
 
 ## Acknowledgments
 

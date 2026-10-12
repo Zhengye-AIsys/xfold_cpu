@@ -129,7 +129,11 @@ class CPUStaticTests(unittest.TestCase):
                 node for node in assignments
                 if any(ast.unparse(target) == f'fastnn_config.{backend}_implementation' for target in node.targets)
             )
-            self.assertEqual(ast.unparse(assignment.value), 'implementation')
+            expected = (
+                "implementation if glu_backend == 'auto' else glu_backend"
+                if backend == 'gated_linear_unit' else 'implementation'
+            )
+            self.assertEqual(ast.unparse(assignment.value), expected)
             self.assertLess(assignment.lineno, model_creation.lineno)
         model_to = calls(init, 'self._model.to')
         self.assertEqual(len(model_to), 1)

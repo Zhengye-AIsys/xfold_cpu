@@ -8,7 +8,7 @@
 #include <limits>
 #include <memory>
 
-namespace {
+namespace af3_detail {
 
 void check_tensor(const at::Tensor& tensor) {
     TORCH_CHECK(tensor.device().is_cpu(), "Native tools require CPU tensors.");
@@ -50,7 +50,11 @@ at::Tensor aligned_empty(const at::Tensor& like, at::IntArrayRef shape, int64_t 
     return at::from_blob(data, shape, [owner](void*) {}, like.options());
 }
 
-}  // namespace
+}  // namespace af3_detail
+
+using af3_detail::aligned_empty;
+using af3_detail::check_tensor;
+using af3_detail::xsmm_size;
 
 at::Tensor pad_and_align_tensor(const at::Tensor& tensor, at::IntArrayRef shape,
                                bool need_init, double init, int64_t alignment) {

@@ -1,8 +1,8 @@
-# Optional C++ / LIBXSMM infrastructure (stage 3)
+# Optional C++ / LIBXSMM tools and GLU (stages 3–4)
 
 This is a separate, optional package. Installing or importing xfold does not build,
-load, or require it. No model operator is replaced in this stage. The stage 1 FP32
-and stage 2 BF16 autocast paths keep using ordinary PyTorch operators.
+load, or require it. Stage 3 added tools only. Stage 4 adds a GLU operator selected
+explicitly by `--glu_backend=cpp`; default FP32/BF16 inference still uses PyTorch.
 
 ## Source and build
 
@@ -37,7 +37,7 @@ match the manifest. It is read as an input, copied into a separate build workspa
 and never built in place. Normal builds use the vendored snapshot and need no
 network access. Importing the Python package never invokes a compiler.
 
-## Explicit tools (not used by the model)
+## Infrastructure tools
 
 ```python
 import af3_kernels
@@ -71,9 +71,44 @@ tensor construction raises an exception.
   an even inner dimension and packs B before dispatch. Output and accumulation
   are FP32. Unsupported JIT shapes raise an error; there is no silent fallback.
 
-Future operator migration must explicitly handle stage 2's FP32 stored weights
-and BF16 autocast state, including weight packing/cache lifecycle. This stage
-does not change the baseline to explicit all-BF16 storage.
+## GLU operator and Transition integration (stage 4)
+
+`gated_linear_unit(x, weight, M_BLK=128, N_BLK=128)` accepts contiguous CPU
+FP32/BF16 tensors without gradients, with matching dtypes and shapes `[..., K]`
+and `[K, 2*N]`. The weight is the transposed `nn.Linear.weight`; the first N
+columns are the SiLU gate and the second N columns are the value projection.
+The result has shape `[..., N]` and the input dtype. Arbitrary leading dimensions,
+empty leading dimensions, partial M/N tiles, and odd K in BF16 are handled.
+K and 2*N must be positive and fit LIBXSMM integers; block sizes must also be
+positive LIBXSMM integers. Unsupported dtype, layout, shape, or JIT kernel fails
+explicitly. Inputs are never modified.
+
+The implementation uses two LIBXSMM GEMMs per tile, with FP32 accumulation.
+BF16 weights are packed as VNNI2 over pairs of K rows; odd K is zero-padded first.
+Per-thread scratch holds the two projection tiles. C++ SiLU and multiply write
+directly into the final output, avoiding a full `[M, 2*N]` intermediate tensor.
+GEMM descriptors, edge descriptors, and scratch allocation are prepared before
+the OpenMP region. GEMM output, SiLU output, and final multiplication are stored
+in the selected dtype to follow the PyTorch GLU's rounding boundaries. Floating
+point accumulation and transcendental implementation can still produce numeric
+differences; this has not been checked on the Mac.
+
+The raw native API does not implement autocast or autograd. xfold's lazy bridge
+in `xfold/fastnn/gated_linear_unit.py` reads CPU autocast before disabling it around
+native dispatch, converts local inputs, and leaves the stored FP32 parameters
+unchanged. Both ordinary and diffusion Transitions call this bridge. Each owns
+one contiguous transposed/converted weight cache, which refreshes for versioned
+mutations (including `load_state_dict`/the JAX loader), storage/shape/stride changes,
+device/dtype changes, and FP32/BF16 mode changes. Unversioned inference tensors
+bypass reuse. Mutating parameters through `.data` or external raw storage bypasses
+PyTorch's mutation tracking and is not supported with this cache.
+
+Only the contiguous converted weight is cached in this stage; VNNI packing runs
+on each BF16 call. LayerNorm, the second Linear, adaptive conditioning, and other
+model operators keep their existing implementations. `--glu_backend=auto` retains
+the old backend selection, while `torch` and `cpp` select GLU explicitly. A `cpp`
+request preflights loading before model/weight construction and rejects CUDA or
+an old extension without the GLU symbol. There is no automatic fallback.
 
 ## Validation status
 
@@ -84,16 +119,40 @@ python -m unittest discover -s tests -p 'test_*static.py' -v
 ```
 
 The checks cover Python syntax, optional loading, build configuration, packaging,
-source checksums, native interface/API consistency, and preservation of model
-operators. They do not compile the native extension or test GEMM/VNNI correctness.
-Native build, alignment/layout tests, FP32/BF16 comparisons, and AMX verification
-remain required on the target cluster.
+source checksums, native interface/API consistency, backend selection, autocast
+bridging, cache lifecycle, both Transition call sites, and edge-shape guards.
+They do not compile the native extension or test GLU/GEMM/VNNI correctness.
+
+On the target cluster, validation should proceed in this order:
+
+1. Rebuild this package in the intended CPU PyTorch environment (including after
+   a stage 3 installation), then inspect `runtime_info()` and the GLU binding.
+2. Under `torch.inference_mode()`, compare native GLU with
+   `torch.nn.functional.silu((x @ w)[..., :N]) * (x @ w)[..., N:]`.
+   Cover FP32, explicit BF16, and the xfold CPU BF16 autocast bridge with FP32
+   stored weights. Record absolute and relative errors before choosing tolerances.
+3. Cover rank 1/2/3/4, empty leading dimensions, M/N below/equal/above 128,
+   nonmultiples of 128, and odd/even K. Test noncontiguous bridge inputs and
+   validation failures, not just the model's usual power-of-two dimensions.
+4. Compare ordinary and diffusion Transitions under both backends using the same
+   weights/inputs. Reload weights, mutate them with version-tracked operations,
+   change dtype/device, and switch FP32/BF16 to validate cache refreshes.
+5. Compare full inference with `--glu_backend=torch` and `cpp`, first FP32 then
+   BF16, holding seeds, sample count, input padding, parameters, and thread settings
+   fixed. Use separate output directories, warm up kernels, and distinguish cold
+   loading/packing time from steady-state latency.
+6. Inspect the generated GEMM kernels/target to establish AMX execution and then
+   measure performance. Neither a successful import nor a target name proves AMX.
+
+These cluster steps are documented for later execution; none ran on the Mac.
 
 ## Attribution
 
 The stage 3 setup script, minimal bindings, and Python loader are newly implemented.
 The padding and packing tools are rewritten using the reference interfaces and
-LIBXSMM APIs; the reference GLU, Triangle Multiplication, Attention, and timing
+LIBXSMM APIs. The stage 4 GLU is a new implementation of the reference's tiled
+projection idea, using the pinned public LIBXSMM API rather than copying its
+functor/timing framework. Reference Triangle Multiplication, Attention, and timing
 implementations were not copied. Newly written source files carry no Xflops brand
 or copyright claim. Third-party licenses and required notices are retained.
 

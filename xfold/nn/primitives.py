@@ -14,6 +14,7 @@ import torch
 import torch.nn as nn
 
 from xfold import fastnn
+from xfold.fastnn.gated_linear_unit import GLUWeightCache
 
 
 class Transition(nn.Module):
@@ -27,10 +28,12 @@ class Transition(nn.Module):
             c_x, self.num_intermediate_factor * c_x * 2, bias=False)
         self.transition2 = nn.Linear(
             self.num_intermediate_factor * c_x, c_x, bias=False)
+        self._glu_weight_cache = GLUWeightCache()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.input_layer_norm(x)
-        c = fastnn.gated_linear_unit(x, self.transition1.weight.T)
+        c = fastnn.gated_linear_unit(
+            x, self.transition1.weight.T, weight_cache=self._glu_weight_cache)
         return self.transition2(c)
 
 

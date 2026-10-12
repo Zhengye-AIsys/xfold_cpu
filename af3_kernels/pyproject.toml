@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "af3_kernels"
-version = "0.1.0"
-description = "Optional CPU C++/LIBXSMM infrastructure for xfold"
+version = "0.2.0"
+description = "Optional CPU C++/LIBXSMM tools and GLU for xfold"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { file = "LICENSE" }
