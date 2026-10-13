@@ -1,324 +1,123 @@
-# Optional C++ / LIBXSMM CPU operators (stages 3–7)
+# C++ / LIBXSMM CPU 算子
 
-This is a separate, optional package. Installing or importing xfold does not build,
-load, or require it. Stage 3 added tools; stage 4 added opt-in GLU. Stages 5/6
-add opt-in Triangle Multiplication and Grid/SelfAttention. Default FP32/BF16 CPU
-inference still uses PyTorch. Package version 0.4.0 must be rebuilt on the cluster
-to include the new bindings, even if an earlier stage is already installed.
+`af3_kernels` 是 xfold 的可选扩展包，当前版本为 0.4.0，提供 GLU、Linear、Triangle Multiplication 和 Attention 接口。主项目默认使用 PyTorch，安装或导入 xfold 不会构建该扩展。原生后端用于 Linux x86_64 CPU 推理。
 
-## Source and build
+## 构建
 
-The LIBXSMM build-source snapshot is pinned to
-`0d1f61ed425aae8318fffafeea9834971a33aec7`, matching the reference af3_kernels
-commit `40d3b7dfb8d2328c96e2f05863e3e0dfcd654301`.
-`libxsmm.lock.json` records the upstream URL, revision, and file SHA-256 values.
-Only build inputs are vendored; upstream sample datasets, tests, and documentation
-are omitted. No Git metadata, compiled library, or path to the reference checkout
-is included. Retained upstream source and licenses are unchanged.
+LIBXSMM 源码固定为 `0d1f61ed425aae8318fffafeea9834971a33aec7`，对应参考 af3_kernels 的提交 `40d3b7dfb8d2328c96e2f05863e3e0dfcd654301`。`libxsmm.lock.json` 保存来源、版本和 SHA-256；仓库包含构建所需文件及许可证，不包含样例数据、Git 元数据或预编译库。
 
-Build on Linux x86_64 in the target CPU PyTorch environment. The reference
-environment uses Python 3.11, PyTorch 2.6.0+cpu, and GCC/G++ 13.3. GNU Make,
-setuptools, wheel, and an OpenMP-capable compiler are required. From xfold's root:
+在目标 CPU PyTorch 环境中，从 xfold 根目录执行：
 
 ```bash
 MAX_JOBS=8 CC=gcc CXX=g++ \
   python -m pip install -v --no-build-isolation --no-deps ./af3_kernels
 ```
 
-`--no-build-isolation` makes the extension use the active PyTorch headers and ABI.
-`--no-deps` avoids replacing that PyTorch installation. The build validates the
-source checksums, copies only manifest-listed files into a fresh build directory,
-rechecks the copies, builds static PIC
-`libxsmm.a` and `libxsmmnoblas.a`, and links them into `af3_kernels._C`.
-OpenMP is enabled for both compiling and linking the extension. `-march=native`
-requires building on the intended target architecture; rebuild when moving to
-another CPU or changing PyTorch.
+构建需要 GNU Make、setuptools、wheel 和支持 OpenMP 的编译器。参考环境为 Python 3.11、PyTorch 2.6.0+cpu、GCC/G++ 13.3。`--no-build-isolation` 使用当前 PyTorch 的头文件和 ABI，`--no-deps` 避免构建时替换依赖。
 
-`LIBXSMM_ROOT` may select another source checkout only if all pinned build files
-match the manifest. It is read as an input, copied into a separate build workspace,
-and never built in place. Normal builds use the vendored snapshot and need no
-network access. Importing the Python package never invokes a compiler.
+构建流程先校验源码，再将清单文件复制到独立目录，生成静态 PIC 库 `libxsmm.a`、`libxsmmnoblas.a` 并链接到 `af3_kernels._C`。扩展编译和链接均启用 OpenMP。使用 `-march=native`，因此更换 CPU 架构或 PyTorch 后需重新构建。
 
-## Infrastructure tools
+`LIBXSMM_ROOT` 可指定其他源码目录，但文件需与固定清单一致，构建仍在副本中进行。默认源码构建无需网络。Python 包导入不调用编译器。
+
+## 基础接口
 
 ```python
 import af3_kernels
 
-print(af3_kernels.is_available())  # Explicit probe; does not compile anything.
-print(af3_kernels.runtime_info())  # Requires the built native extension.
+print(af3_kernels.is_available())
+print(af3_kernels.runtime_info())
 ```
 
-`runtime_info` reports the compiled revision, detected/selected LIBXSMM target,
-PyTorch version, and OpenMP thread limit. A target name does not prove that AMX
-instructions executed; that requires inspecting generated kernels on the target.
+`runtime_info()` 返回 LIBXSMM 版本和目标架构、PyTorch 版本及 OpenMP 最大线程数。是否实际执行 AMX 指令需进一步检查目标机器生成的内核。
 
-The native tensor tools are inference-only and accept CPU, strided FP32/BF16
-tensors without gradients:
+原生接口接受无梯度的 strided CPU FP32/BF16 张量。共轭和 negative-bit 视图应先 resolve，直接接口不处理 autocast 或 autograd；xfold 的桥接层负责数据准备。
 
-Conjugate/negative-bit views must be resolved before passing raw storage to these
-tools. Aligned allocations use shared ownership so storage is also released if
-tensor construction raises an exception.
+| 接口 | 输入和行为 |
+| --- | --- |
+| `pad_and_align_tensor(x, shape, need_init=True, init=0.0, alignment=64)` | 保持 rank/dtype，只扩展不缩小；已连续且对齐时可返回原张量。关闭初始化后，填充区内容未指定 |
+| `vnni_repack_tensor(x, type=2, BLK_SZ=0)` | 非空连续二维 BF16，行数为偶数；type=2 按两行打包。正 BLK_SZ 需整除列数 |
+| `gemm(a, b)` | 非空连续二维矩阵，dtype 和内部维度匹配；BF16 的 K 为偶数。累积及输出为 FP32，用于接口检查 |
 
-- `pad_and_align_tensor(x, shape, need_init=True, init=0.0, alignment=64)`:
-  preserves rank and dtype, pads without shrinking, and uses aligned storage.
-  An already contiguous/aligned tensor of the requested shape may be returned
-  unchanged. With `need_init=False`, padding contents are unspecified.
-- `vnni_repack_tensor(x, type=2, BLK_SZ=0)`: contiguous, nonempty 2D BF16 input
-  with an even row count. Type 2 packs pairs of rows in VNNI2 order; a positive
-  block size must divide the columns. The output is opaque packed storage with
-  the same shape, not an ordinary matrix for PyTorch operations.
-- `gemm(a, b)`: a small-matrix infrastructure probe using LIBXSMM JIT, not a
-  replacement for model Linear/Attention. Inputs are contiguous, nonempty 2D
-  matrices with matching FP32/BF16 dtype and compatible dimensions. BF16 requires
-  an even inner dimension and packs B before dispatch. Output and accumulation
-  are FP32. Unsupported JIT shapes raise an error; there is no silent fallback.
+VNNI 输出是与原矩阵形状相同的打包存储，不能作为普通 PyTorch 矩阵使用。对齐分配采用共享所有权管理存储。
 
-## GLU operator and Transition integration (stage 4)
+## GLU 与 Linear
 
-`gated_linear_unit(x, weight, M_BLK=128, N_BLK=128)` accepts contiguous CPU
-FP32/BF16 tensors without gradients, with matching dtypes and shapes `[..., K]`
-and `[K, 2*N]`. The weight is the transposed `nn.Linear.weight`; the first N
-columns are the SiLU gate and the second N columns are the value projection.
-The result has shape `[..., N]` and the input dtype. Arbitrary leading dimensions,
-empty leading dimensions, partial M/N tiles, and odd K in BF16 are handled.
-K and 2*N must be positive and fit LIBXSMM integers; block sizes must also be
-positive LIBXSMM integers. Unsupported dtype, layout, shape, or JIT kernel fails
-explicitly. Inputs are never modified.
-
-The implementation uses two LIBXSMM GEMMs per tile, with FP32 accumulation.
-BF16 weights are packed as VNNI2 over pairs of K rows; odd K is zero-padded first.
-Per-thread scratch holds the two projection tiles. C++ SiLU and multiply write
-directly into the final output, avoiding a full `[M, 2*N]` intermediate tensor.
-GEMM descriptors, edge descriptors, and scratch allocation are prepared before
-the OpenMP region. GEMM output, SiLU output, and final multiplication are stored
-in the selected dtype to follow the PyTorch GLU's rounding boundaries. Floating
-point accumulation and transcendental implementation can still produce numeric
-differences; this has not been checked on the Mac.
-
-The raw native API does not implement autocast or autograd. xfold's lazy bridge
-in `xfold/fastnn/gated_linear_unit.py` reads CPU autocast before disabling it around
-native dispatch, converts local inputs, and leaves the stored FP32 parameters
-unchanged. Both ordinary and diffusion Transitions call this bridge. Each owns
-one contiguous transposed/converted weight cache, which refreshes for versioned
-mutations (including `load_state_dict`/the JAX loader), storage/shape/stride changes,
-device/dtype changes, and FP32/BF16 mode changes. Unversioned inference tensors
-bypass reuse. Mutating parameters through `.data` or external raw storage bypasses
-PyTorch's mutation tracking and is not supported with this cache.
-
-Only the contiguous converted weight is cached in this stage; VNNI packing runs
-on each BF16 call. LayerNorm, the second Linear, adaptive conditioning, and other
-model operators keep their existing implementations. `--glu_backend=auto` retains
-the old backend selection, while `torch` and `cpp` select GLU explicitly. A `cpp`
-request preflights loading before model/weight construction and rejects CUDA or
-an old extension without the GLU symbol. There is no automatic fallback.
-
-Stage 7 optionally extends these caches to retain VNNI2 weights; the default
-`off` mode preserves stage 4/5/6's per-call packing behavior.
-
-## Triangle and Attention operators (stages 5–6)
-
-All new raw APIs require CPU inference tensors with resolved views and no
-gradients. They do not infer CPU autocast state. The xfold bridges handle autocast,
-detaching inference parameters, contiguous copies, and cache invalidation.
-
-- `linear(x, weight, bias=None)` accepts `[..., K]`, transposed weight `[K, N]`,
-  and optional `[N]` bias, all contiguous with matching FP32/BF16 dtype. Output
-  is `[..., N]` in that dtype. It flattens leading dimensions, tiles the matrix
-  operation, adds the selected-dtype bias to FP32 accumulation, and only then
-  rounds/stores the result. Batched tiled GEMM is also used internally by Triangle.
-- `triangle_multiplication(pair, mask, outgoing, left_weight, left_bias,
-  projection, gate, center_weight, center_bias, output_weight, gating_weight,
-  left_eps=1e-5, center_eps=1e-5, block_size=128)` returns only the Triangle update
-  `[N, N, C]`. Pair input is contiguous FP32/BF16; mask may be absent, scalar,
-  `[N]`, or broadcastable to `[N, N]` and is used multiplicatively. Linear weights
-  are contiguous `[C, 2*C]`, `[C, 2*C]`, `[C, C]`, `[C, C]`, all in the selected
-  compute dtype. Normalization vectors keep their own compatible input dtype,
-  with optional biases. ATen implements LayerNorm/sigmoid in C++; LIBXSMM handles
-  projections and contraction. Adjacent projected channels form A/B. Outgoing
-  computes `A @ B.T`; incoming computes `B.T @ A`. Projection/gate/contraction
-  inputs are released before output projections to limit overlapping allocations.
-- `dot_product_attention(q, k, v, mask=None, bias=None, query_block=128,
-  q_pre_scaled=False)` accepts contiguous matching-dtype FP32/BF16 Q/K/V of
-  shapes `[B, H, Q, D]`, `[B, H, K, D]`, `[B, H, K, Dv]`. Q/K may have different
-  lengths, and D/Dv need not match. Bias is FP32/BF16 and broadcastable to
-  `[B, H, Q, K]`. Mask rank 1 means `[K]`, rank 2 means `[B, K]`; those ranks are
-  converted to bool. Other mask ranks up to 4 must already be boolean and
-  broadcastable. True means a valid key. Broadcast views retain their strides
-  rather than materializing full mask/bias tensors. Zero-length keys return a
-  zero output, and empty batches/heads/queries return empty outputs.
-
-Native attention scales Q once, uses LIBXSMM for QK/PV, and uses FP32 max/exp/sum
-inside a query tile for softmax. Projection, bias addition, softmax, and PV outputs
-follow the selected dtype boundaries. The xfold bridge scales Q before casting
-for the first matmul, then passes `q_pre_scaled=True` to avoid scaling twice.
-The finite `-1e9` mask is applied after bias, matching the original PyTorch code;
-fully masked real rows retain its uniform softmax. NaNs/infinities are not hidden
-with `nan_to_num`. Odd BF16 head/K dimensions are padded for VNNI2; internal PV
-padding receives zero probability. This computes full-key softmax per query block,
-not online softmax. Scratch is proportional to `threads * query_block * K`, plus
-one FP32 exponential row per thread; packing buffers and original model bias
-storage are additional allocations. It does not prove reduced total peak memory
-or a speedup without cluster measurements.
-
-`GridSelfAttention` uses native bias/Q/K/V/gating/output projections and native
-attention, while its normalization and transpose flow remain in Python/PyTorch.
-Diffusion `SelfAttention` uses native Q (including bias)/K/V/gating and attention,
-while adaptive normalization/output conditioning remain PyTorch. MSA and
-CrossAttention are unchanged. Each module keeps its existing parameter names
-and owns stage 4 cache objects; no replacement class is selected at import time.
-
-`--triangle_backend=auto|torch|cpp` and `--attention_backend=auto|torch|cpp` select
-the two families independently. `cpp` preflights the required native symbols
-before model/weight construction. PyTorch/CUDA defaults remain unchanged.
-
-## Cache lifecycle and packed weight ABI (stage 7)
-
-`--cache_mode=off|weights|inputs|all` selects caches independently of native
-operators. `off` is the default. `weights` reuses BF16 packed parameters in native
-GLU, Linear (including Grid/SelfAttention projections), and the four Triangle
-projections. Changing Q/K/V activations and contraction operands are not retained.
-FP32 stays on the ordinary path. Source version/storage/layout/dtype/device keys
-invalidate contiguous and packed copies; unversioned weights are packed without
-retention. Stored FP32 parameters and checkpoint keys remain unchanged.
-
-The 0.4.0 binding exposes `_C.packed_weight_api == 1`. GLU/Linear accept
-`weight_packed=False`; Triangle accepts `weights_packed=False`. True means BF16
-full-width VNNI2 (`BLK_SZ=0`) with original K zero-padded to the next even value.
-The packed tensor is opaque storage of shape `[K_padded, N]` (or `[K_padded, 2*N]`
-for GLU). Original input K is validated independently; inputs are padded and
-prepacked weights bypass conversion. Triangle contraction operands stay normal.
-The bridge requests True only for selected BF16 packed caches. Ordinary calls
-preserve earlier argument lists. Missing stage 7 markers are rejected before
-model construction when native packed caching is requested, and on direct packed
-cache use. Rebuild in the active target PyTorch environment; imports never build.
-
-Input caches use `xfold.nn.cache.InputCache` inside `input_cache_scope()`. Every
-AlphaFold3 call starts fresh and clears input data on exit, including exceptions.
-Recycle and diffusion phase boundaries release their feature caches too.
-`AlphaFold3.reset_input_cache()` clears feature caches while retaining weights.
-For standalone module comparisons, explicitly enter `input_cache_scope()` under
-`torch.inference_mode()` with eval modules; unscoped/gradient/training calls bypass
-input reuse.
-
-Cached components are initial recycle embeddings/masks/relative/bond features,
-diffusion static conditioning, diffusion/atom transformer pair logits, and atom
-encoder static conditioning/layout conversions. Dynamic positions, Fourier noise
-embedding, noise-conditioned single transitions, queries/key activations, MSA
-sampling and recycled updates remain uncached. Clone-before-update protects
-mutable initial activations and diffusion single conditioning; pair conditioning
-stays read-only. The trunk's one-shot atom encoder bypasses retention, preserving
-capacity for repeated denoising.
-
-Keys include scope, recursive dependency identities/versions/layouts, versioned
-parameters, LayerNorm eps/shape, head layout, precision and backend settings.
-Sources are retained to prevent allocator/id reuse. Versionless inference feature
-tensors are immutable within an explicit scope; reset caches before mutating
-them. Versionless parameters bypass reuse, and `.data`/external-storage writes
-bypass mutation tracking. Multiple input/seed model calls use fresh scopes.
-
-The example-wide quota defaults to 512 MiB (`--input_cache_max_mb`). Entries charge
-full backing storage, deduplicating aliases within one entry and conservatively
-charging aliases across entries. Replacement/reset releases quota. Entries that
-do not fit execute normally without retention. The limit excludes weight copies,
-existing inputs, scratch and transient storage. Packed caches retain contiguous
-and packed copies until invalidated; compare memory in fresh processes.
-
-## Validation status
-
-On the development Mac, validation is source-only:
-
-```bash
-python -m unittest discover -s tests -p 'test_*static.py' -v
+```text
+gated_linear_unit(x, weight, M_BLK=128, N_BLK=128, weight_packed=False)
+linear(x, weight, bias=None, weight_packed=False)
 ```
 
-The checks cover Python syntax, optional loading, build configuration, packaging,
-source checksums, native interface/API consistency, backend selection, autocast
-bridging, cache lifecycle, both Transition call sites, and edge-shape guards.
-Stages 5/6 also check explicit dispatch, preserved parameter modules, Triangle
-directions/interleaving/residual ownership, attention broadcast/scaling/masking,
-bias rounding, and bounded scratch allocation before parallel execution.
-Stage 7 adds scope/cleanup, training/gradient bypass, dependency/weight keys,
-capacity accounting, immutable/mutable boundaries and packed-weight guards.
-They do not compile the native extension or test GLU/GEMM/VNNI correctness.
+GLU 输入为 `[..., K]`，weight 为转置后的 `[K, 2N]`，前 N 列是 SiLU gate，后 N 列是 value projection。输出为 `[..., N]`。Linear 输入为 `[..., K]`，weight 为 `[K, N]`，可选 bias 为 `[N]`。普通输入均需连续且 dtype 匹配，输出使用计算 dtype。
 
-On the target cluster, validation should proceed in this order:
+GLU 每个 tile 使用两个 LIBXSMM GEMM，累积为 FP32，SiLU 与乘法在 C++ 中写入输出，减少完整 `[M, 2N]` 中间张量。BF16 按 K 两行打包，奇数 K 先补零。实现处理任意前导维度、空前导维度和 M/N 尾块；K、输出宽度及块尺寸应为正且符合 LIBXSMM 整数范围。
 
-1. Rebuild this package in the intended CPU PyTorch environment (including after
-   a stage 3 installation), then inspect `runtime_info()` and the GLU binding.
-2. Under `torch.inference_mode()`, compare native GLU with
-   `torch.nn.functional.silu((x @ w)[..., :N]) * (x @ w)[..., N:]`.
-   Cover FP32, explicit BF16, and the xfold CPU BF16 autocast bridge with FP32
-   stored weights. Record absolute and relative errors before choosing tolerances.
-3. Cover rank 1/2/3/4, empty leading dimensions, M/N below/equal/above 128,
-   nonmultiples of 128, and odd/even K. Test noncontiguous bridge inputs and
-   validation failures, not just the model's usual power-of-two dimensions.
-4. Compare ordinary and diffusion Transitions under both backends using the same
-   weights/inputs. Reload weights, mutate them with version-tracked operations,
-   change dtype/device, and switch FP32/BF16 to validate cache refreshes.
-5. Compare full inference with `--glu_backend=torch` and `cpp`, first FP32 then
-   BF16, holding seeds, sample count, input padding, parameters, and thread settings
-   fixed. Use separate output directories, warm up kernels, and distinguish cold
-   loading/packing time from steady-state latency.
-6. Inspect the generated GEMM kernels/target to establish AMX execution and then
-   measure performance. Neither a successful import nor a target name proves AMX.
+描述符、尾块和每线程 scratch 在 OpenMP 区域前准备。GLU 按选定 dtype 的边界存储中间结果；Linear 在 FP32 累积后加入计算 dtype 的 bias，再舍入输出。实际数值误差仍需与目标 PyTorch 路径对照。
 
-These cluster steps are documented for later execution; none ran on the Mac.
+`Transition` 和 `DiffusionTransition` 使用 GLU 桥接层，读取 CPU autocast 状态后转换局部输入及权重副本，原参数保持 FP32。每个模块保留转置/连续化权重缓存，按版本、存储、形状、stride、device 和 dtype 变化失效。无版本计数的权重不复用；通过 `.data` 或外部存储修改参数会绕过版本跟踪，不适用于该缓存。
 
-Additional stages 5/6 cluster validation:
+## Triangle Multiplication
 
-1. Rebuild the 0.3.0 package and check the `linear`, `triangle_multiplication`, and
-   `dot_product_attention` symbols before model inference.
-2. Compare Linear with/without bias and Triangle in both directions against
-   PyTorch, first FP32, then explicit BF16, then BF16 autocast with FP32 stored
-   parameters. Include fractional masks, empty dimensions, odd channel/token
-   sizes, and tiles below/equal/above the block size. Confirm residual addition
-   happens exactly once and weights/checkpoint keys remain unchanged.
-3. Compare attention with D and Dv equal/unequal, odd/even D/K, unequal Q/K
-   lengths, query-block remainders, absent bias/mask, broadcasted and noncontiguous
-   bias/mask, rank-1/rank-2 key masks, rank-3/rank-4 boolean masks, and empty keys.
-   Cover partially/fully masked rows, extreme logits, and NaN/infinity behavior.
-   Measure absolute/relative errors and choose tolerances from recorded results.
-4. Compare both Grid transpose directions and conditioned/unconditioned diffusion
-   SelfAttention, including Q bias. Reload/mutate/move weights and switch precision
-   to check cache refreshes. Run end-to-end comparisons with Triangle and Attention
-   individually enabled before combining them with stage 4 GLU.
-5. Hold input/seeds/samples/threads fixed; record cold/warm timings and peak memory
-   as well as output differences. Inspect generated kernels to verify AMX use.
+```text
+triangle_multiplication(pair, mask, outgoing,
+    left_weight, left_bias, projection, gate,
+    center_weight, center_bias, output_weight, gating_weight,
+    left_eps=1e-5, center_eps=1e-5, block_size=128,
+    weights_packed=False)
+```
 
-Additional stage 7 cluster validation:
+pair 和返回的更新量均为 `[N, N, C]`。mask 可省略、为标量、`[N]` 或可广播到 `[N, N]` 的张量，按乘法作用于 projection。四组转置权重分别为 `[C, 2C]`、`[C, 2C]`、`[C, C]` 和 `[C, C]`，使用选定计算 dtype；归一化向量保留兼容 dtype，bias 可选。
 
-1. Rebuild 0.4.0 and verify the ABI marker. Compare cached/unpacked BF16 GLU,
-   Linear with bias, Triangle in both directions, and Grid/SelfAttention,
-   including odd K/output widths and block remainders. Confirm no double packing
-   or parameter/input mutation. Record numeric errors rather than assuming
-   bitwise equality from static checks.
-2. Compare `off`, `weights`, `inputs`, `all` at matching precision/backends. Reuse
-   one model for A → B → A and multiple seeds, including equal-length different
-   proteins; compare each with fresh models and the uncached path. Change trunk
-   embeddings and conditioning-enabled/disabled modes too.
-3. Reload/mutate tracked weights, move/change dtype, switch backend/LayerNorm eps,
-   call `reset_input_cache`, and force exceptions. Confirm feature data is released
-   while valid packed weights can persist across examples.
-4. Repeat with quotas 0/small/large and oversized pair logits. Recomputed paths
-   must preserve results. Training/gradient-enabled and standalone unscoped calls
-   must not retain input features.
-5. Record cold/warm timings and peak memory in separate processes. Include
-   signature checks, clones, packing and capacity effects before attributing
-   a performance or memory improvement.
+LIBXSMM 完成投影及通道收缩，ATen 完成 LayerNorm 和 sigmoid。相邻投影通道构成 A/B；outgoing 计算 `A @ B.T`，incoming 计算 `B.T @ A`。接口返回更新量，残差由 Pairformer 加入。输出投影前释放不再使用的 projection/gate/contraction 缓冲区。
 
-## Attribution
+## Attention
 
-The stage 3 setup script, minimal bindings, and Python loader are newly implemented.
-The padding and packing tools are rewritten using the reference interfaces and
-LIBXSMM APIs. The stage 4 GLU is a new implementation of the reference's tiled
-projection idea, using the pinned public LIBXSMM API rather than copying its
-functor/timing framework. Stages 5/6 implement the Triangle and blocked Attention
-ideas with the pinned public LIBXSMM API and the original xfold semantics; the
-reference implementations and timing framework were not copied. Newly written
-source files carry no Xflops brand
-or copyright claim. Third-party licenses and required notices are retained.
+```text
+dot_product_attention(q, k, v, mask=None, bias=None,
+    query_block=128, q_pre_scaled=False)
+```
 
-Padding and VNNI interfaces follow the BSD-licensed af3_kernels reference.
-See `LICENSE` for Xflops/Intel notices. LIBXSMM retains its upstream BSD-3-Clause
-license in `third_party/libxsmm/LICENSE.md`; a copy is packaged in
-`src/af3_kernels/licenses/LIBXSMM.txt` for binary distributions.
+Q/K/V 分别为 `[B, H, Q, D]`、`[B, H, K, D]`、`[B, H, K, Dv]`，需连续且 FP32/BF16 dtype 匹配。Q/K 长度及 D/Dv 可不同。bias 为 FP32/BF16，可广播至 `[B, H, Q, K]`。一维 mask 表示 `[K]`，二维表示 `[B, K]`，转换为 bool；其余最高四维 mask 应为可广播的 bool，True 表示有效 key。
+
+原生实现按 query 分块计算完整 key 维度上的 softmax，LIBXSMM 执行 QK/PV，max/exp/sum 使用 FP32。该实现不是 online softmax。scratch 约随 `线程数 × query_block × K` 增长，打包缓冲区和原模型 bias 存储另计。
+
+桥接层先缩放 Q 再转换 dtype，并传入 `q_pre_scaled=True`，保持原计算顺序。bias 后应用有限值 `-1e9` mask，全掩码行保留原实现对真实 key 的均匀 softmax；NaN/Inf 不替换为零。BF16 奇数 D/K 为 VNNI2 补齐，PV 内部补位概率为零。零长度 key 返回零输出，空 batch/head/query 返回空输出。
+
+`GridSelfAttention` 接入原生 bias/Q/K/V/gating/output 投影和 Attention，归一化及转置继续使用 PyTorch。扩散 `SelfAttention` 接入 Q（含 bias）/K/V/gating 投影和 Attention，自适应归一化及输出条件化继续使用 PyTorch。MSA 和 CrossAttention 保留原实现。
+
+## 后端与缓存
+
+`--glu_backend`、`--triangle_backend` 和 `--attention_backend` 分别选择 `auto|torch|cpp`。auto 保留 CPU PyTorch 和原 CUDA 选择；cpp 在模型构建前检查扩展及所需符号，失败时报告错误。参数名称和 checkpoint 布局保留。
+
+| `--cache_mode` | 缓存内容 |
+| --- | --- |
+| `off` | 关闭新增缓存，保留既有连续化权重缓存 |
+| `weights` | 保留原生 BF16 GLU/Linear/Triangle 的 VNNI2 权重 |
+| `inputs` | 单次模型调用内的可复用静态特征 |
+| `all` | 同时启用以上两类新增缓存 |
+
+0.4.0 扩展提供 `_C.packed_weight_api == 1`。GLU/Linear 的 `weight_packed` 和 Triangle 的 `weights_packed` 默认 False；True 表示全宽 VNNI2 存储，原始 K 补至偶数，形状为 `[K_padded, N]`，GLU 为 `[K_padded, 2N]`。预打包权重跳过重复转换，Triangle 的动态收缩操作数仍按普通矩阵处理。
+
+输入缓存通过 `InputCache` 和 `input_cache_scope()` 实现。每次 AlphaFold3 调用开启新作用域，退出及异常时清理输入数据；recycle 与 diffusion 阶段切换时释放对应缓存，权重缓存可继续保留。独立模块测试需在 eval、`torch.inference_mode()` 和显式作用域下运行。
+
+缓存内容包括 recycle 初始 embedding/mask、relative/bond 特征、扩散静态条件、transformer pair logits 和 atom encoder 静态条件及布局转换。动态坐标、噪声级 embedding、噪声条件化 single transition、动态 Q/K、MSA 随机采样和 recycle 更新继续计算。可变初始激活在更新前复制。
+
+key 包含输入作用域、依赖对象身份及版本/布局、参数版本、LayerNorm eps/shape、head 布局、精度和后端设置。无版本计数的 inference 特征按作用域内不可变处理，修改前需重置缓存；无版本参数不复用。training、启用梯度或未进入作用域的调用跳过输入缓存。
+
+`--input_cache_max_mb` 默认 512 MiB，0 关闭保留。计费按底层 storage，单条记录中的别名去重，跨条目保守计费；超额条目重新计算。该限额不包含模型、权重副本、scratch 和瞬时分配，不能作为 RSS 上限。
+
+## 验证进展与集群复现
+
+本机完成源码/接口检查、六个编译单元的语法检查，以及 PyTorch CPU 模块和缓存测试。原生扩展未在 Linux 上链接或执行，GLU/GEMM/VNNI 的原生数值及 AMX 性能待验证，条件见 [测试记录](../docs/executable_validation.md)。
+
+集群复现按以下顺序进行：
+
+1. 在目标环境重新构建 0.4.0，核对 `runtime_info()`、算子符号和 packed ABI 标记。
+2. 固定权重和输入，分别比较原生 GLU、Linear、Triangle 两方向和 Attention 与 PyTorch 的 FP32/BF16 输出，记录绝对、相对误差。
+3. 覆盖奇数通道、空维度、块尺寸以下/等于/以上及不能整除的尺寸；Attention 增加不同 D/Dv、Q/K 长度、广播 mask/bias、全掩码、NaN/Inf 情况。
+4. 比较普通和扩散 Transition、Grid 两个方向及带条件的 SelfAttention，确认残差仅加入一次。重载和修改权重、切换精度/后端，核对缓存失效。
+5. 对 `off/weights/inputs/all` 比较复用模型 A→B→A、多种子、相同长度不同输入，以及容量不足和异常清理。先分别启用算子及缓存，再组合运行完整预测。
+6. 分别记录冷启动、预热后延迟及峰值内存，检查生成内核中的 AMX 指令后再分析性能变化。
+
+## 来源与许可证
+
+padding/VNNI 接口及分块计算思路参考 BSD 许可的 af3_kernels，GLU、Triangle 和 Attention 按 LIBXSMM 公开 API 与 xfold 的计算语义实现。第三方声明保留于 [LICENSE](LICENSE)。LIBXSMM 使用其 [BSD-3-Clause 许可证](third_party/libxsmm/LICENSE.md)，二进制包附带副本 `src/af3_kernels/licenses/LIBXSMM.txt`。

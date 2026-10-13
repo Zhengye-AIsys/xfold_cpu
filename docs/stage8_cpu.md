@@ -1,138 +1,67 @@
-# Stage 8: optional IPEX LayerNorm and CPU runtime configuration
+# CPU LayerNorm 与线程、NUMA 配置
 
-Only xfold is changed. xfold_cpu remains a read-only implementation reference.
-The development Mac runs source and shell-syntax checks only; there is no Torch,
-IPEX, model, binding, or native-kernel execution during those checks.
+本文对应第八阶段实现。LayerNorm 后端、线程数和进程绑定分别配置，可用于比较不同运行组合。优化对象为 xfold，xfold_cpu 作为实现参考。
 
-## LayerNorm selection
+## LayerNorm 后端
 
-| Flag | Behavior |
+| 参数 | 实现 |
 | --- | --- |
-| `--layer_norm_backend=auto` | Existing selection: PyTorch CPU; Triton CUDA when fastnn is enabled |
-| `--layer_norm_backend=torch` | Original `F.layer_norm` implementation |
-| `--layer_norm_backend=ipex` | Explicit CPU IPEX public functional API |
+| `--layer_norm_backend=auto` | CPU 使用 PyTorch；CUDA 在启用 fastnn 时使用 Triton |
+| `--layer_norm_backend=torch` | 原有 `F.layer_norm` |
+| `--layer_norm_backend=ipex` | IPEX 的 `llm.functional.fast_layer_norm` |
 
-IPEX selection is independent of `--cpu_precision`, the three native operator
-backend flags and `--cache_mode`. It does not imply BF16, LIBXSMM or AMX.
-The wrapper retains the original LayerNorm module, parameter names, weight/bias
-objects, optional affine parameters, normalized shape and epsilon. It passes
-the current input and autocast context to IPEX without dtype conversion,
-detachment or added contiguous copies. FP32 stored parameters remain FP32.
-The opt-in path supports eval FP32/BF16 CPU inference; training, gradients that
-require backpropagation, other devices/layouts/dtypes are rejected explicitly.
+IPEX 路径保留原 LayerNorm 模块及其参数名、weight/bias、normalized shape 和 epsilon。输入和参数按当前精度传入，不额外转换 dtype；参数仍以 FP32 存储。该路径用于 eval 模式下的 FP32/BF16 CPU 推理，其他设备、布局、数据类型或需要反向传播的调用会报错。
 
-Only the selected IPEX path imports `intel_extension_for_pytorch`. The runner
-preflights Linux x86_64, successful import and a callable
-`ipex.llm.functional.fast_layer_norm` before allocating/loading the model.
-Version/import errors, including IPEX's import-time exits, become an actionable
-error; there is no silent backend fallback. Direct LayerNorm use has the same
-lazy dependency checks. Auto/PyTorch require no IPEX installation.
+仅选择 `ipex` 时加载 `intel_extension_for_pytorch`。模型构建前检查 Linux x86_64 平台、库导入和 API 是否可用，失败时报告错误。IPEX 单独安装，版本应与目标 PyTorch 环境匹配；更换 PyTorch 后需要重新构建原生扩展。
 
-On the cluster, install a **CPU IPEX release compatible with the existing
-PyTorch environment**, following the target release's requirements. Do not
-install a latest unpinned IPEX wheel over the validated native build environment.
-If PyTorch changes, rebuild `af3_kernels` in that environment before native use.
-The main xfold dependency list is unchanged; IPEX is installed separately.
-The selected path logs IPEX and PyTorch versions and its public API name.
+此处接入的是 functional 接口，没有使用 `ipex.optimize`、全模型替换或 JIT。部分 IPEX 版本的 FastLayerNorm 内部仍调用 PyTorch，具体收益需要测量。原生 Triangle 中的 LayerNorm 继续使用 ATen。
 
-The interface follows the [IPEX CPU API documentation](https://intel.github.io/intel-extension-for-pytorch/cpu/2.6.0%2Bcpu/tutorials/api_doc.html)
-and [public functional implementation](https://github.com/intel/intel-extension-for-pytorch/blob/main/intel_extension_for_pytorch/llm/functional/fusions.py).
-IPEX versions may delegate FastLayerNorm to PyTorch's LayerNorm; the
-[CPU implementation](https://github.com/intel/intel-extension-for-pytorch/blob/main/intel_extension_for_pytorch/transformers/models/cpu/fusions/mha_fusion.py)
-currently does so. A successful call does not establish a faster kernel.
-No `ipex.optimize`, whole-model replacement, JIT tracing or `torch.compile` is
-introduced. Native Triangle's two normalizations retain their ATen calls.
+切换 LayerNorm 后端会使输入缓存失效。IPEX 导入可能注册进程级算子，因此 PyTorch/IPEX 的数值、时间和内存对照应分别使用新进程。
 
-Switching the LayerNorm configuration invalidates stage 7 input-cache keys.
-Importing IPEX can register process-wide operators; selecting `torch` afterwards
-does not unload them. Use separate fresh processes for strict PyTorch/IPEX
-accuracy, timing and memory comparisons, including native combinations.
+## 线程设置
 
-## Thread settings
+`--cpu_threads` 设置 PyTorch intra-op 线程数，`--cpu_interop_threads` 设置 inter-op 线程数。默认不修改运行时设置；指定值时要求为正的 32 位整数，并在模型构建前配置。
 
-`--cpu_threads` sets PyTorch intra-op parallelism; `--cpu_interop_threads` sets
-inter-op parallelism. Both default to unset. Explicit values must be positive
-32-bit integers and require a resolved CPU device. Configuration runs before
-optional operator loaders and model/weight construction.
+inter-op 数量已匹配时跳过设置。若已使用的线程池不能接受新数量，程序报告错误；inter-op 先于 intra-op 设置，避免失败后只改变其中一项。线程数量不随输入重置。
 
-An already matching inter-op count is left alone, allowing repeated runners
-with the same setting. A differing request that PyTorch cannot apply raises an
-error requesting a fresh process. Inter-op is configured first so such a failure
-does not partially change intra-op settings. There is no per-input thread reset.
-See [PyTorch intra-op guidance](https://docs.pytorch.org/docs/stable/generated/torch.set_num_threads.html)
-and the [inter-op one-time-setting contract](https://docs.pytorch.org/docs/stable/generated/torch.set_num_interop_threads.html).
+Python 参数配置 PyTorch 线程池。原生扩展使用的 OpenMP 运行时还需要环境变量，因此启动脚本在 Python 启动前设置 `OMP_NUM_THREADS` 和 `MKL_NUM_THREADS`。启动日志记录线程数、可用 CPU 集合及相关环境变量。
 
-Python flags configure PyTorch; they do not guarantee the thread count of a
-separately linked OpenMP runtime in LIBXSMM. The launcher exports consistent
-`OMP_NUM_THREADS`/`MKL_NUM_THREADS` values **before Python starts**. Direct Python
-use logs conflicting environment values rather than changing environment
-variables after library initialization. Logs also show PyTorch counts, allowed
-CPU IDs when the platform exposes them, and selected affinity variables.
+## 启动脚本
 
-## Single-process cluster launcher
+```text
+bash scripts/run_cpu.sh [--dry-run] <run_alphafold.py 参数>
+```
 
-Use `bash scripts/run_cpu.sh [--dry-run] <run_alphafold.py flags>` from the checkout.
-`--dry-run` must be the first argument; it prints environment/escaped command
-without launching Python or numactl or checking target hardware. The actual
-launcher requires Linux. It locates the runner relative to itself, while input,
-model and output paths retain the caller's working-directory semantics.
-It selects CPU and defaults to `--run_data_pipeline=False`; an explicit pipeline
-flag can override that default. Thread and device flags are launcher-owned:
-use the environment settings below rather than passing those three flags again.
-Both single- and double-dash spellings of the three managed flags are rejected.
-`--flagfile`/`-flagfile` is also rejected because nested file contents could
-override the launcher settings; pass the runner flags directly. Other operator,
-cache, precision and input flags are forwarded as arguments. This follows
-[Abseil's flag parsing and flagfile precedence](https://github.com/abseil/abseil-py/blob/main/absl/flags/_flagvalues.py).
+`--dry-run` 必须位于首个参数，只打印环境和命令；正式执行要求 Linux。脚本固定选择 CPU，默认关闭数据流水线，输入应已完成 MSA/template 处理。其他模型参数直接转发。
 
-| Environment variable | Unset behavior / accepted values |
+device、cpu_threads 和 cpu_interop_threads 由脚本统一管理，重复传入单破折号或双破折号形式均会被拒绝。flagfile 也不转发，以免覆盖脚本配置。运行参数中的相对路径按调用时的工作目录解释。
+
+| 环境变量 | 默认值或用途 |
 | --- | --- |
-| `XFOLD_CPU_PYTHON` | `python`; executable name or path |
-| `XFOLD_CPU_ENV_FILE` | No config file; explicitly selected readable shell file |
-| `XFOLD_CPU_THREADS` | Inherit; positive integer sets PyTorch, OpenMP and MKL |
-| `XFOLD_CPU_INTEROP_THREADS` | Inherit; positive integer sets PyTorch inter-op |
-| `XFOLD_CPU_CPUS` | Inherit scheduler cpuset; CPU list such as `0-7,16-23` or `+0-7` |
-| `XFOLD_CPU_NODES` | Inherit; NUMA node CPU list; mutually exclusive with `XFOLD_CPU_CPUS` |
-| `XFOLD_CPU_MEM_POLICY` | `inherit`; optional `bind`, `interleave`, `local` |
-| `XFOLD_CPU_MEM_NODES` | Empty; required for bind/interleave, forbidden for inherit/local |
-| `XFOLD_CPU_AFFINITY` | `inherit`; optional `compact`, `spread`, `none` |
-| `XFOLD_CPU_KMP_BLOCKTIME` | Inherit; optional nonnegative Intel OpenMP blocktime |
-| `XFOLD_CPU_OMP_LIBRARY` | No preload; optional readable absolute library path |
-| `XFOLD_CPU_ALLOCATOR_LIBRARY` | No preload; optional readable absolute library path |
+| `XFOLD_CPU_PYTHON` | `python`，也可指定解释器路径 |
+| `XFOLD_CPU_ENV_FILE` | 可选配置文件，需指定可读路径 |
+| `XFOLD_CPU_THREADS` | 不设置时继承；设置后同步 PyTorch、OpenMP 和 MKL 线程数 |
+| `XFOLD_CPU_INTEROP_THREADS` | 不设置时继承；设置 PyTorch inter-op 数量 |
+| `XFOLD_CPU_CPUS` | 指定 CPU 列表，如 `0-7,16-23` 或相对列表 `+0-7` |
+| `XFOLD_CPU_NODES` | 按 NUMA 节点选择 CPU，与 `XFOLD_CPU_CPUS` 互斥 |
+| `XFOLD_CPU_MEM_POLICY` | `inherit`、`bind`、`interleave` 或 `local` |
+| `XFOLD_CPU_MEM_NODES` | bind/interleave 时指定内存节点 |
+| `XFOLD_CPU_AFFINITY` | `inherit`、`compact`、`spread` 或 `none` |
+| `XFOLD_CPU_KMP_BLOCKTIME` | 可选的非负 Intel OpenMP blocktime |
+| `XFOLD_CPU_OMP_LIBRARY` | 可选 OpenMP 库绝对路径 |
+| `XFOLD_CPU_ALLOCATOR_LIBRARY` | 可选分配器库绝对路径 |
 
-Copy/edit `scripts/cpu_env.sh.example` outside tracked files, then select it
-explicitly. It is sourced shell configuration, so use a file you maintain.
-Its assignments override identically named values supplied in the environment.
-The example has empty counts and inherited policies; no machine topology or
-cluster paths are embedded.
+配置模板为 `scripts/cpu_env.sh.example`。配置文件以 shell 方式读取，其中赋值覆盖同名环境变量，宜复制为单独的作业配置。
 
-Compact/spread use `OMP_PLACES=cores` and `OMP_PROC_BIND=close/spread`; none uses
-`OMP_PROC_BIND=false`. Explicit affinity rejects conflicting `KMP_AFFINITY` or
-`GOMP_CPU_AFFINITY` settings; unset those variables before using the portable
-policy. Inherit preserves the existing runtime settings. KMP blocktime is
-meaningful only with a runtime that supports it.
+compact/spread 对应 `OMP_PLACES=cores` 与 `OMP_PROC_BIND=close/spread`；none 设置 `OMP_PROC_BIND=false`。选择这些策略前需清除已有的 `KMP_AFFINITY` 和 `GOMP_CPU_AFFINITY` 冲突项。inherit 保留已有设置。
 
-Exact CPU IDs use `numactl --physcpubind`; node CPU selection uses `--cpunodebind`.
-Memory bind/interleave/local map to `--membind`/`--interleave`/`--localalloc`.
-No binding request means no numactl dependency. The launcher uses arrays, checks
-mutually exclusive/required settings and does not use eval or bypass scheduler
-restrictions with `--all`. Numactl validates actual IDs, topology and permissions
-on the target. See [the numactl source](https://github.com/numactl/numactl/blob/master/numactl.c).
+CPU 列表和节点列表分别对应 numactl 的 `--physcpubind`、`--cpunodebind`。内存策略对应 `--membind`、`--interleave` 和 `--localalloc`；未选择绑定时不依赖 numactl。CPU 编号、节点和线程数应按调度器分配及实际拓扑填写，dry-run 不检查节点资源是否可用。
 
-Choose IDs and thread counts from the scheduler allocation and actual topology;
-do not assume a socket equals one NUMA node or every logical CPU is a separate
-physical core. Dry-run does not validate whether the target grants those CPUs.
+库预加载默认关闭。设置预加载时，路径必须为可读绝对路径且不含空白或冒号；已有 `LD_PRELOAD` 保留。OpenMP 库需与 PyTorch、IPEX 和原生扩展的构建环境匹配。
 
-Preloads are explicit absolute readable files without whitespace/colons;
-existing `LD_PRELOAD` is preserved. No library is preloaded by default. Match
-the OpenMP runtime used by PyTorch, IPEX and the native extension; do not preload
-Intel OpenMP over a conflicting GNU OpenMP build or assume a copied lib path is
-compatible. A preload path check establishes only file availability. Allocator
-and runtime changes need separate cluster validation and memory measurements.
+## 集群对照
 
-## Later cluster comparison
-
-For an already featurized input, first compare LayerNorm with fixed threads:
+以下参数用于检查命令构造，线程数需按实际分配调整：
 
 ```bash
 XFOLD_CPU_THREADS=8 XFOLD_CPU_INTEROP_THREADS=1 \
@@ -143,9 +72,7 @@ XFOLD_CPU_THREADS=8 XFOLD_CPU_INTEROP_THREADS=1 \
     --model_dir="$PATH_TO_AF3_MODEL" --output_dir=./stage8_torch
 ```
 
-On the cluster remove `--dry-run`, then run a fresh process changing only
-LayerNorm to `ipex` and the output directory. Repeat FP32/BF16. Then vary thread
-counts, followed by affinity, then NUMA placement. An illustrative binding is:
+正式运行时去掉 `--dry-run`。对照 IPEX 时，在新进程中只修改 LayerNorm 后端和输出目录，分别测 FP32/BF16。之后再调整线程数、绑核和内存策略，避免同时改变多个因素。
 
 ```bash
 XFOLD_CPU_THREADS=8 XFOLD_CPU_INTEROP_THREADS=1 \
@@ -156,36 +83,13 @@ XFOLD_CPU_CPUS=+0-7 XFOLD_CPU_MEM_POLICY=local XFOLD_CPU_AFFINITY=compact \
     --model_dir="$PATH_TO_AF3_MODEL" --output_dir=./stage8_bound
 ```
 
-These numbers/policies are examples for command construction, not performance
-recommendations. Keep input, seed, samples, weights and operator/cache choices
-fixed during each comparison. Validate:
+主要检查项目为 LayerNorm 输出 dtype 和数值误差、缺失或不兼容依赖、线程池重设、输入缓存失效，以及实际 CPU/NUMA 放置。可结合 `torch.__config__.parallel_info()` 和原生 `runtime_info()` 检查运行时信息；冷启动、预热后延迟和峰值内存分别记录。
 
-1. LayerNorm FP32/BF16, BF16 activation with FP32 parameters, bias/no bias,
-   no affine parameters, rank/shape variations, noncontiguous and empty inputs;
-   preserve output dtype and measure numerical error against PyTorch.
-2. Missing/wrong IPEX dependency or API, invalid thread values, non-CPU/training/
-   gradient calls, same/differing inter-op requests in a reused process, and
-   stage 7 backend/cache invalidation.
-3. Actual allowed CPU set, NUMA allocation and active OpenMP runtime; inspect
-   `torch.__config__.parallel_info()` and native `runtime_info()`'s
-   `openmp_max_threads` when using LIBXSMM. Measure affinity rather than assuming
-   environment settings guarantee placement.
-4. End-to-end accuracy and fresh-process cold/warm timing/peak memory; enable
-   earlier native operators and caches individually before combining them.
-   Validate optional runtime/allocator preloads separately.
+本机已完成线程设置、PyTorch LayerNorm 和启动脚本的隔离运行测试。IPEX 执行、实际绑核/NUMA 放置及性能对照待集群验证，测试记录见 [可执行性测试](executable_validation.md)。
 
-## Static validation on this Mac
+## 接口依据
 
-```bash
-python3 -m unittest discover -s tests -p 'test_*static.py' -v
-bash -n scripts/run_cpu.sh
-bash -n scripts/cpu_env.sh.example
-git diff --check
-```
-
-Checks cover source syntax, optional loading/preflight, preserved PyTorch/default
-behavior, parameter/precision contracts, cache keys, thread validation/timing,
-and launcher argument/environment/binding guards. Shell checks parse only; they
-do not run even the dry-run launcher. No dependency installation, IPEX import,
-Tensor/model execution, native build, or accuracy/performance test ran here.
-MPI/oneCCL remains reserved for stage 9.
+- [IPEX CPU API](https://intel.github.io/intel-extension-for-pytorch/cpu/2.6.0%2Bcpu/tutorials/api_doc.html)及 [functional 实现](https://github.com/intel/intel-extension-for-pytorch/blob/main/intel_extension_for_pytorch/llm/functional/fusions.py)。
+- [IPEX CPU LayerNorm 实现](https://github.com/intel/intel-extension-for-pytorch/blob/main/intel_extension_for_pytorch/transformers/models/cpu/fusions/mha_fusion.py)。
+- PyTorch [intra-op](https://docs.pytorch.org/docs/stable/generated/torch.set_num_threads.html)与 [inter-op](https://docs.pytorch.org/docs/stable/generated/torch.set_num_interop_threads.html)设置说明。
+- [numactl 参数实现](https://github.com/numactl/numactl/blob/master/numactl.c)与 [Abseil 参数解析](https://github.com/abseil/abseil-py/blob/main/absl/flags/_flagvalues.py)。

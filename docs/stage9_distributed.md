@@ -1,174 +1,87 @@
-# Stage 9: flexible CPU process and work scheduling
+# CPU 采样与任务并行调度
 
-The reference xfold_cpu diffusion code fixes five samples, 200 steps and at most
-five **ranks**, with a handwritten table of step segments and broadcasts. A rank
-is a worker process, not necessarily a physical node. This xfold implementation
-uses generic independent-work scheduling and leaves xfold_cpu unchanged.
+第九阶段将并行粒度设为完整扩散样本或完整预测任务。参考 xfold_cpu 的相关采样调度固定为 5 个样本、200 步，最多 5 个 rank；当前实现按工作项统一分配，进程数、样本数和扩散步数可独立配置。rank 指进程，不能直接等同于物理节点。
 
-## Modes and ownership
+## 计算划分
 
-`--distributed_mode=off` preserves serial inference, its default RNG sequence,
-operator choices, parameter names and FP32/BF16 storage/precision handling.
-It never loads torch.distributed or oneCCL through the new coordinator.
+| 模式 | 分配单位 | 主进程职责 |
+| --- | --- | --- |
+| `off` | 原有串行推理 | 执行完整预测 |
+| `samples` | 同一输入、同一种子的完整扩散轨迹 | 特征准备、主干计算、置信度/距离分布及输出 |
+| `tasks` | 完整输入或输入/种子组合 | 输入读取、结果汇总、排名及输出 |
 
-`samples` processes inputs/seeds in their existing order. Rank 0 loads inputs,
-featurizes and computes the Evoformer trunk once; it broadcasts embeddings with
-their existing dtype. Each rank runs complete assigned diffusion trajectories,
-then all ranks participate in result broadcasts in the same owner/sample order.
-Rank 0 computes confidence/distogram, extracts structures and writes outputs.
-Empty assignments still participate in coordination and communication.
+默认模式为 `off`。普通串行路径保留原有随机数序列和后端选择。
 
-`tasks` schedules complete inputs or input/seed pairs. Each worker uses its local
-model for full serial inference on assigned jobs. Results are gathered to rank 0,
-which writes each completed input once and ranks its samples in original seed
-order. Workers never race over JSON, sample directories or ranking_scores.csv.
-Granularity is selected with `--distributed_task_granularity=auto|input|seed`:
-auto chooses input when there are multiple inputs, otherwise seed. Seed mode
-flattens all input/seed pairs, allowing multiple inputs and seeds in the same wave.
-Input mode avoids re-featurizing each seed as a separate input job.
+采样模式按原始输入和种子顺序运行。rank 0 准备特征并执行主干及 recycle，向其他进程广播特征和 embeddings。各进程完成分配到的样本，随后按一致顺序广播坐标；rank 0 计算输出头、提取结构并写出。每个样本的全部扩散步骤由同一进程顺序执行，空闲进程仍参与同步。
 
-Each rank has a full model replica, even if its assignment is empty. Model/weights
-must fit per rank. This is task/sample parallelism; it does not implement the
-reference's operator-level distributed Triangle/Attention kernels. Trunk and
-output heads remain rank-0 work in sample mode. There is no fixed node/rank cap,
-but increasing ranks beyond independent work does not create additional compute
-parallelism. Five samples expose at most five concurrent diffusion trajectories.
-Use more samples, seeds, inputs or fewer processes as appropriate.
+任务模式中，每个进程独立执行分配任务的特征准备、主干、采样和输出头。结果汇总到 rank 0，每个输入按原始种子顺序生成全局排名。`--distributed_task_granularity` 可选 `input`、`seed` 或 `auto`：auto 在多个输入时按输入分配，单个输入时按种子分配；seed 将所有输入/种子组合展开为任务列表。
 
-## Scheduling and counts
+各进程保存完整模型。该方案属于样本/任务并行，算子内部仍在单个进程上执行，与参考项目的多 rank Triangle/Attention 实现有所不同。进程数超过独立工作数量时会出现空闲；采样模式的主干和输出头仍集中在 rank 0。
 
-`--num_diffusion_samples` and `--diffusion_steps` must be positive integers;
-their defaults remain 5 and 200. There is no fixed-step segmentation table.
+## 分配规则与随机数
 
-| `--distributed_schedule` | Assignment |
+`--num_diffusion_samples` 和 `--diffusion_steps` 为正整数，默认值分别为 5 和 200。
+
+| `--distributed_schedule` | 分配规则 |
 | --- | --- |
-| `cyclic` | Rank r receives indices r, r+world_size, ... |
-| `block` | Contiguous balanced ranges, with remainder assigned to early ranks |
-| `weighted` | Contiguous ranges from cumulative integer capacities |
+| `cyclic` | rank r 处理 r、r+world_size、r+2×world_size 等索引 |
+| `block` | 连续均分，余数分配给前面的 rank |
+| `weighted` | 按全局 rank 权重的累积比例划分连续区间 |
 
-Weighted mode uses `--distributed_rank_weights=...`, with one nonnegative integer
-per actual global rank and a positive sum. Zero gives no sample/task work to that
-rank; rank 0 still performs its coordinating/trunk/output roles. For total work T,
-range boundaries are `floor(T * prefix_weight / total_weight)`. Adjacent ranges
-share boundaries, so they cover all work once, including nondivisible totals.
-These are user-specified capacities, not measured throughput or automatic
-load balancing. Task mode executes synchronized waves, so one slower job can
-hold up the next wave; use the granularity and weights accordingly.
+加权调度通过 `--distributed_rank_weights` 指定每个 rank 的非负整数权重，数量应等于实际进程数，总和大于 0。对总工作量 T，区间边界为 `floor(T × prefix_weight / total_weight)`。零权重不给该 rank 分配计算任务；rank 0 的汇总和采样模式主干职责仍保留。权重由用户配置，任务按同步轮次执行，慢任务可能推迟下一轮。
 
-No rank count is inferred from the number of samples or channels. World size
-comes from the launched process group and can be less than, equal to or greater
-than work count. Physical host count, processes per host, threads per process and
-task/sample count are separate settings.
+`--sample_rng=auto|legacy|indexed` 中，auto 在串行和任务模式使用 legacy，在采样模式使用 indexed；采样模式不接受 legacy。indexed 根据原始种子和样本索引，通过 BLAKE2b 生成 CPU 随机流，每个样本独立保存和恢复 CPU RNG 状态。种子生成不依赖 rank、world size 或分配规则，去噪步公式沿用原实现。
 
-## RNG and serial comparisons
+采样数值对照应使用串行 `--sample_rng=indexed`，并固定输入、参数、步数、精度和后端。legacy 与 indexed 的随机流不同，不宜直接做逐位比较。任务模式的 auto/legacy 与原串行模式对照。
 
-`--sample_rng=auto|legacy|indexed` defaults to auto: legacy in off/task mode,
-indexed in sample mode. Explicit legacy is rejected in sample mode.
-Indexed mode uses stable BLAKE2b stream seeds from the original seed and sample
-index, without rank, world size, Python hash or scheduling policy. Each sample
-isolates/restores CPU RNG state and uses the original denoising step function.
-It does not reseed CUDA inside the added sample stream. Initial coordinates,
-noise schedule and original denoising arithmetic are preserved in their CPU
-precision path; this stage does not fix/change the existing denoising formula.
+## 通信与异常处理
 
-For numerical comparisons, use serial **indexed** CPU sampling versus distributed
-indexed sampling, holding input, samples, steps, model, backend and precision
-fixed. Legacy serial and indexed sampling intentionally consume different RNG
-streams and can produce different structures. Task mode with auto/legacy uses
-the existing per-seed random reset; compare input/seed granularity with ordinary
-serial mode. Actual numerical parity across CPU hardware remains unvalidated.
+通信由 `torch.distributed` 的 Gloo 或可选 ccl 后端执行，默认 Gloo。MPI 在此作为进程启动方式，不是单独的 PyTorch 通信后端。选择 ccl 时加载 `oneccl_bindings_for_pytorch`，要求 Linux x86_64 及匹配的 CPU bindings。单 rank 模式不创建进程组，也不加载 oneCCL。
 
-## Communication and lifecycle
+rank 环境变量按 torchrun、PMI、Open MPI、Slurm 的顺序识别。每组 rank/world-size 变量需完整，重新使用 MPI 启动前应清除残留的 `RANK`、`WORLD_SIZE` 和 `LOCAL_RANK`。多 rank 运行通过 `env://` 初始化，要求各进程可访问 `MASTER_ADDR` 和 `MASTER_PORT`。
 
-`--distributed_backend=gloo|ccl` defaults to CPU Gloo. Multi-rank ccl explicitly
-imports `oneccl_bindings_for_pytorch`; use CPU bindings matching the target
-PyTorch environment. The [oneCCL binding repository](https://github.com/intel/torch-ccl)
-is marked deprecated, so it remains an optional reference-compatible choice.
-Gloo provides the ordinary PyTorch CPU communication path. A one-rank distributed
-mode needs no process group or oneCCL import and reports that its backend is unused.
+控制信息使用 CPU int64，张量按 uint8 字节视图分块广播，保留 FP32/BF16 位表示。对象采用 pickle protocol 5，按 16 MiB 分块传输；仅汇总到主进程的结果由 rank 0 保留和解码，其他接收进程复用单块缓冲区。
 
-Runtime rank mapping prefers a complete RANK/WORLD_SIZE pair from torchrun, then
-PMI (Intel MPI), Open MPI, then Slurm. Partial families and invalid values fail
-clearly. Stale canonical RANK/WORLD_SIZE/LOCAL_RANK variables should be removed
-before a fresh MPI launch. Multiple ranks require an explicit reachable
-MASTER_ADDR and MASTER_PORT. Initialization is explicit env:// with configurable
-`--distributed_timeout_seconds=3600`. This must cover the longest computation
-phase, including trunk, a whole trajectory/job and output handling.
+`--distributed_max_payload_mb=4096` 限制单个序列化对象，不限制模型、张量或进程总内存。所有进程需使用兼容的 Python/PyTorch/AlphaFold3 类。真实输入和结构结果的序列化应在目标 AlphaFold3 版本上复验。
 
-The [PyTorch distributed API](https://docs.pytorch.org/docs/stable/distributed)
-defines rank/group setup and collective ordering. Controls use explicit CPU int64;
-tensor data is broadcast as bounded uint8 views, preserving FP32/BF16 bits.
-Variable objects use protocol-5 serialization over 16 MiB chunks, including
-unequal/empty task results. Full objects are retained/decoded only where needed;
-discarding ranks reuse one chunk buffer during root-only gathering. This avoids
-requiring backend-specific object-gather APIs. The [CCL datatype/reduction mapping](https://github.com/intel/torch-ccl/blob/master/src/utils.cpp)
-includes the control/data types used here.
+计算、转换、分配、解码、提取结构和写出阶段在下一次通信前同步 Python 异常。进程组在 finally 中释放，异常退出不增加额外 barrier。进程被杀、通信故障或系统内存耗尽仍可能依赖启动器终止或超时；目前没有断点恢复和动态增减 rank。
 
-`--distributed_max_payload_mb=4096` limits each serialized object, not total RSS
-or tensor/model memory. Large features, serialized source data, decoded objects
-and pending results need additional memory; raise the explicit budget only after
-checking capacity. All ranks require compatible Python/PyTorch/AlphaFold3 classes
-for object serialization. Verify input/result transport on the actual installed
-AlphaFold3 release; the [Structure serialization implementation](https://github.com/google-deepmind/alphafold3/blob/main/src/alphafold3/structure/structure.py)
-removes cached properties when pickling.
+`--distributed_timeout_seconds` 默认 3600，需覆盖主干、完整轨迹/任务和输出等最长阶段。模型、输入、输出和调度设置在各 rank 间应一致，线程数和本地绑定可以不同。模型调用继续使用原有输入缓存作用域，各进程缓存独立。
 
-Managed phases agree on Python computation failures before the next collective,
-including feature/model allocation, trunk, diffusion, conversion, structure
-extraction and output. Errors report the failed rank and phase. Serialization,
-receiving allocations and decoding have collective guards.
-Tensor layout/contiguity and byte-view preparation also agree before broadcasting.
-Process groups are destroyed in finally; no exit barrier is added on errors. A killed process,
-transport failure, import failure before coordinator entry, or exhausted system
-memory can still require launcher termination/collective timeout. There is no
-checkpoint/resume or live rank join/leave support in this stage.
+并行运行要求 CPU、启用推理、关闭数据流水线，并提供完成 MSA/template 的输入。输入名称清洗后应唯一，同一输入的种子不能重复，以免输出目录冲突。
 
-Stage 7 feature scopes/reset boundaries remain intact for every model call;
-each process has private feature/weight caches. Communication, serialized data
-and model replicas are outside the input-cache quota. Stage 8 precision/operator/
-cache flags remain independent. Model/collective/input/output settings must match
-across ranks; CPU thread counts and worker-local binding may differ.
+## 启动配置
 
-Distributed modes currently require CPU, inference enabled, and completed
-MSA/template data (`--run_data_pipeline=False`). Run the data pipeline separately.
-Input output names must be distinct after sanitization and seeds unique within an
-input, preventing accidental output collisions. Serial mode retains its existing
-pipeline behavior.
+```text
+bash scripts/run_distributed.sh [--dry-run] <推理参数>
+```
 
-## Launch options
+脚本复用 `scripts/run_cpu.sh`，分布式设置通过 `XFOLD_DIST_*` 环境变量配置。`--dry-run` 位于首个参数，只打印命令；正式启动要求 Linux。配置文件赋值覆盖同名环境变量，模板见 `scripts/distributed_env.sh.example`。重复传入 distributed 参数或 flagfile 会被拒绝。
 
-Use `bash scripts/run_distributed.sh [--dry-run] <runner flags>` in a shared
-checkout/environment. Dry-run must come first and prints only configuration and
-escaped command; static checks on this Mac do not execute even that mode.
-
-Common launcher environment:
-
-| Variable | Default / role |
+| 环境变量 | 默认值或用途 |
 | --- | --- |
-| XFOLD_DIST_LAUNCHER | torchrun / openmpi / intelmpi / external |
-| XFOLD_DIST_MODE | samples / tasks |
-| XFOLD_DIST_BACKEND | gloo / ccl |
-| XFOLD_DIST_SCHEDULE | cyclic / block / weighted |
-| XFOLD_DIST_RANK_WEIGHTS | Empty; comma-separated capacities for weighted mode |
-| XFOLD_DIST_TASK_GRANULARITY | auto / input / seed |
-| XFOLD_DIST_NNODES | 1; homogeneous launch host count |
-| XFOLD_DIST_PPN | 1 for torchrun/count derivation; MPI placement is forced only when explicitly set |
-| XFOLD_DIST_NODE_RANK | 0 on one host; required per host for multi-host torchrun |
-| XFOLD_DIST_WORLD_SIZE | MPI explicit total; otherwise NNODES * PPN |
-| XFOLD_DIST_HOSTFILE | Optional readable implementation-specific MPI hostfile |
-| XFOLD_DIST_MPIRUN | mpirun; choose the intended MPI implementation explicitly |
-| XFOLD_DIST_MPI_BINDING | none / inherit; avoids MPI single-core binding by default |
-| XFOLD_DIST_TIMEOUT_SECONDS | 3600; longest-phase timeout |
-| XFOLD_DIST_MAX_PAYLOAD_MB | 4096 per serialized object |
-| XFOLD_DIST_ENV_FILE | Explicit readable shell configuration file |
+| `XFOLD_DIST_LAUNCHER` | `torchrun`；可选 openmpi、intelmpi、external |
+| `XFOLD_DIST_MODE` | `samples`；也可选 tasks |
+| `XFOLD_DIST_BACKEND` | `gloo`；可选 ccl |
+| `XFOLD_DIST_SCHEDULE` | `cyclic`；可选 block、weighted |
+| `XFOLD_DIST_RANK_WEIGHTS` | weighted 时填写各 rank 权重 |
+| `XFOLD_DIST_TASK_GRANULARITY` | `auto`；可选 input、seed |
+| `XFOLD_DIST_NNODES` | `1`，同构启动节点数 |
+| `XFOLD_DIST_PPN` | `1`；MPI 仅在显式设置时强制每节点进程数 |
+| `XFOLD_DIST_NODE_RANK` | 单节点为 0；多节点 torchrun 需分别设置 |
+| `XFOLD_DIST_WORLD_SIZE` | MPI 总进程数，未设置时为 NNODES×PPN |
+| `XFOLD_DIST_HOSTFILE` | MPI 对应格式的主机文件 |
+| `XFOLD_DIST_MPIRUN` | `mpirun`，可指定实际启动器 |
+| `XFOLD_DIST_MPI_BINDING` | `none` 或 inherit |
+| `XFOLD_DIST_TIMEOUT_SECONDS` | `3600` |
+| `XFOLD_DIST_MAX_PAYLOAD_MB` | `4096` |
+| `XFOLD_DIST_ENV_FILE` | 可选 shell 配置文件 |
 
-MASTER_ADDR/MASTER_PORT are the PyTorch rendezvous endpoint. The one-host default
-is 127.0.0.1:29500; multi-host launches/hostfiles require MASTER_ADDR. Choose a
-free port for each job. Config file assignments override identically named
-environment settings. Copy/edit `scripts/distributed_env.sh.example` for the job;
-distributed settings use XFOLD_DIST_* rather than forwarded runner flags, and
-flagfiles are rejected to prevent overriding launcher-owned choices.
+单机 rendezvous 默认 `127.0.0.1:29500`。多节点或使用主机文件时需指定可达的 MASTER_ADDR；每个作业使用独立端口。
 
-### One host / homogeneous torchrun
+### 单机与同构 torchrun
+
+以下为 8 个进程计算 7 个样本的命令示例，线程数按实际资源调整：
 
 ```bash
 XFOLD_DIST_PPN=8 XFOLD_DIST_MODE=samples XFOLD_CPU_THREADS=4 \
@@ -178,22 +91,13 @@ XFOLD_DIST_PPN=8 XFOLD_DIST_MODE=samples XFOLD_CPU_THREADS=4 \
     --model_dir="$PATH_TO_AF3_MODEL" --output_dir=./samples_8ranks
 ```
 
-For multiple homogeneous hosts, start one launcher on every allocated host with
-the same NNODES/PPN/MASTER_ADDR/MASTER_PORT and a distinct NODE_RANK. Torchrun
-requires homogeneous local worker counts; see its [launch documentation](https://docs.pytorch.org/docs/stable/elastic/run).
-The script disables automatic restarts to avoid repeating partially written jobs.
-It uses no-python workers so CPU/NUMA environment settings apply before the
-worker's model Python process starts. Torchrun itself may default OMP_NUM_THREADS
-to 1; explicitly select XFOLD_CPU_THREADS for the intended compute allocation.
+多节点时，每个节点启动一次脚本，使用相同 NNODES、PPN、MASTER_ADDR 和端口，以及不同 NODE_RANK。torchrun 要求每个节点的本地进程数相同。脚本关闭自动重启，避免重复执行已部分写出的任务；worker 在模型 Python 进程启动前应用 CPU/NUMA 配置。
 
-### Heterogeneous MPI slots / arbitrary total ranks
+### 异构 MPI 分配
 
-An Open MPI hostfile may give different slot counts per host. For example,
-two hosts with 4 and 2 slots form six ranks. Choose a reachable master host,
-unset XFOLD_DIST_PPN to preserve hostfile placement, and set the explicit total:
+Open MPI 主机文件可以为不同节点分配不同 slot 数。采用主机文件布局时，应在环境和配置文件中都取消 PPN 设置，并指定总进程数：
 
 ```bash
-# The hostfile and endpoint must match your real allocation.
 MASTER_ADDR=node01 MASTER_PORT=29500 XFOLD_DIST_LAUNCHER=openmpi \
 XFOLD_DIST_WORLD_SIZE=6 XFOLD_DIST_HOSTFILE=/shared/hosts.openmpi \
 XFOLD_DIST_MODE=tasks XFOLD_DIST_TASK_GRANULARITY=seed XFOLD_CPU_THREADS=8 \
@@ -201,75 +105,30 @@ XFOLD_DIST_MODE=tasks XFOLD_DIST_TASK_GRANULARITY=seed XFOLD_CPU_THREADS=8 \
     --input_dir=/shared/inputs --model_dir=/shared/models --output_dir=/shared/results
 ```
 
-Open MPI uses --hostfile and its slot syntax; see [MPI host scheduling](https://docs.open-mpi.org/en/main/launching-apps/scheduling.html).
-Intel MPI uses -f and optional -ppn; use the [Intel MPI launch syntax](https://www.intel.com/content/www/us/en/docs/mpi-library/developer-guide-linux/2021-15/running-an-mpi-program.html)
-and that implementation's hostfile format. Physical host count is not forced to
-equal world size. MPI binding defaults to none, leaving stage 8/scheduler CPU
-sets in control; choose inherit if the MPI allocation already pins workers.
-No oversubscription, root privilege bypass or scheduler restriction bypass is
-enabled by the script.
+Open MPI 使用 `--hostfile`，Intel MPI 使用 `-f`，主机文件分别按对应启动器的格式准备。MPI 默认关闭自身绑核，将 CPU 放置交给调度器或第八阶段配置；已有 MPI 绑定时可选择 inherit。脚本不启用超额分配。
 
-### Existing MPI/Slurm launch
+已有 MPI/Slurm 作业可设置 `XFOLD_DIST_LAUNCHER=external`，通过集群的 mpirun/srun 为每个 rank 调用一次脚本，并导出 MASTER_ADDR/MASTER_PORT；external 不再启动第二层启动器。程序、模型和输入路径需在各节点可访问，输出由 rank 0 写入。
 
-Set XFOLD_DIST_LAUNCHER=external and invoke the wrapper once per rank using the
-cluster's own mpirun/srun command, with exported MASTER_ADDR/MASTER_PORT. The
-runtime accepts its PMI/Open MPI/Slurm environment. This accommodates scheduler
-launch options and node layouts beyond the supplied wrapper; it does not start a
-second launcher in external mode. Programs, model/input paths and output location
-must be accessible with matching paths across ranks. Only rank 0 writes outputs.
+## 每进程 CPU 配置
 
-## CPU affinity on each worker
-
-The wrapper reuses `scripts/run_cpu.sh` and all stage 8 XFOLD_CPU_* settings.
-Set XFOLD_CPU_ENV_FILE to a shared shell file that assigns worker-local resources
-after examining the launcher's rank variables and host. For example, obtain the
-local rank with:
+使用 `XFOLD_CPU_ENV_FILE` 指定 worker 配置，在启动器设置 rank 变量后按本地 rank 和主机选择 CPU/NUMA 资源。例如：
 
 ```bash
 worker_local_rank=${LOCAL_RANK:-${MPI_LOCALRANKID:-${OMPI_COMM_WORLD_LOCAL_RANK:-${SLURM_LOCALID:-0}}}}
-# Map worker_local_rank/hostname to the actual allocated CPU/node lists here.
+# 按实际分配，将 worker_local_rank 映射为 CPU 和内存节点列表。
 ```
 
-Do not give all workers on a host the same CPU list unless intentional. Reserve
-communication-worker cores when using oneCCL, and match runtime/library versions
-before optional preloads. See [stage 8 configuration](stage8_cpu.md).
-Rank weights describe the global rank order assigned by the chosen launcher,
-not simply hostname order. Inspect actual mapping before selecting capacities.
+同一主机上的进程通常需要不同 CPU 列表。oneCCL 的通信线程也需纳入核数分配。权重对应启动器实际给出的全局 rank 顺序，不能只按主机名顺序填写。CPU 配置详见 [线程与 NUMA 说明](stage8_cpu.md)。
 
-## Validation boundary and cluster checklist
+## 验证进展
 
-The stage9 commit was initially checked only through Python source compilation/
-AST contracts, shell parsing and whitespace/reference audits. A later authorized
-isolated validation also ran small CPU operators, partition matrices and real
-local 3/6-process Gloo coordination on this Mac. See the
-[executable validation report](executable_validation.md) for precise coverage.
-The production distributed launcher still requires Linux. MPI/CCL/IPEX execution,
-native linking/AMX execution, full trained inference and timings remain unvalidated.
+本机已执行调度分配矩阵，以及真实 3/6-process Gloo 通信和轻量采样/任务用例。测试数据、版本和限制见 [测试记录](executable_validation.md)。完整预测、MPI/oneCCL 启动、跨节点运行和性能测量待集群完成。
 
-```bash
-python3 -m unittest discover -s tests -p 'test_*static.py' -v
-bash -n scripts/run_distributed.sh
-bash -n scripts/distributed_env.sh.example
-git diff --check
-```
+集群上先比较串行 indexed 与 samples，再比较串行 legacy 与 tasks；保持精度、后端、参数、输入和种子一致。重点覆盖工作项不足、不能均分和零权重，核对全局排名、输出目录及所有任务的完成情况。之后验证跨节点 Gloo、匹配的 ccl 环境、真实结构序列化和进程故障退出，再测耗时、吞吐和内存。
 
-On the cluster, validate in this order:
+## 接口依据
 
-1. Pure scheduling matrices for 1/2/3/5/6/8+ ranks, zero work, fewer/more jobs,
-   nondivisible totals, weighted zero capacities, and invalid configurations.
-   Prove every work index occurs once and no index is lost or duplicated.
-2. One-rank indexed CPU serial versus sample mode, then 2/6/8+ ranks with
-   1/5/7/13 samples and different step counts. Hold precision/backends fixed.
-   Check order, masks, numerical error and deterministic streams across schedules.
-3. Input and seed task modes versus legacy serial for multiple inputs/seeds,
-   idle workers, different capacities and nondivisible totals. Verify global
-   ranking order/ties, best output, JSON and sample directories.
-4. Gloo first; then matching CPU oneCCL bindings. Test object serialization,
-   unequal result sizes, payload budgets, FP32/BF16 byte transport, reused-model
-   A→B→A, and optional native operators/IPEX/caches individually.
-5. Missing/bad inputs, duplicate names/seeds, invalid flags, rank disagreement,
-   compute/serialization/output exceptions, a killed rank and timeout cleanup.
-   Confirm no exit-barrier hang or duplicate writer; do not claim recovery.
-6. Actual per-host CPU/NUMA placement, communication cores, model replica memory,
-   root pending-result memory and fresh-process cold/warm throughput/latency.
-   More ranks are a supported configuration, not proof of a speedup.
+- [PyTorch distributed](https://docs.pytorch.org/docs/stable/distributed)及 [torchrun](https://docs.pytorch.org/docs/stable/elastic/run)。
+- [Open MPI 主机调度](https://docs.open-mpi.org/en/main/launching-apps/scheduling.html)与 [Intel MPI 启动说明](https://www.intel.com/content/www/us/en/docs/mpi-library/developer-guide-linux/2021-15/running-an-mpi-program.html)。
+- [oneCCL bindings](https://github.com/intel/torch-ccl)项目已标注弃用，使用时需确认匹配版本；[类型与 reduction 映射](https://github.com/intel/torch-ccl/blob/master/src/utils.cpp)。
+- [AlphaFold3 Structure 序列化](https://github.com/google-deepmind/alphafold3/blob/main/src/alphafold3/structure/structure.py)。
